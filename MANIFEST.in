@@ -1,0 +1,10 @@
+# The sdist doubles as an offline fallback for install.sh on networks where
+# GitHub is unreachable, so it has to carry the installer and the helper
+# script it calls -- not just the importable package.
+include install.sh
+include sglang_radeon_rdna3.pth
+recursive-include scripts *.py
+recursive-include docs *.md
+recursive-include tests *.py
+include Dockerfile
+include LICENSE

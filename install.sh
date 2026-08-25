@@ -170,14 +170,30 @@ else
   ok "sglang (editable, from $SGLANG_REF)"
 fi
 
-# Fetch the plugin itself -- small, so a clone is fine.
+# The plugin. We still want the repo for scripts/filter_deps.py and the
+# docs, but PyPI is a faster and more reliable source for the package itself
+# on networks where GitHub is slow.
 PLUGIN_DIR="$WORKDIR/plugin"
 if [ -d "$PLUGIN_DIR/.git" ]; then
-  git -C "$PLUGIN_DIR" fetch --depth 1 origin main -q && git -C "$PLUGIN_DIR" checkout -q FETCH_HEAD
+  git -C "$PLUGIN_DIR" fetch --depth 1 origin main -q 2>/dev/null \
+    && git -C "$PLUGIN_DIR" checkout -q FETCH_HEAD
+elif git clone --depth 1 "$(gh_url "$REPO_SLUG").git" "$PLUGIN_DIR" -q 2>/dev/null; then
+  :
 else
-  git clone --depth 1 "$(gh_url "$REPO_SLUG").git" "$PLUGIN_DIR" -q
+  # Fall back to the sdist, which carries the scripts and docs too.
+  warn "could not clone the plugin repo; fetching the sdist from PyPI"
+  mkdir -p "$PLUGIN_DIR"
+  pip download --no-deps --no-binary :all: -d "$WORKDIR/sdist" \
+      sglang-radeon-rdna3 -q \
+    || die "could not obtain the plugin from GitHub or PyPI"
+  tar xzf "$WORKDIR"/sdist/sglang_radeon_rdna3-*.tar.gz \
+      -C "$PLUGIN_DIR" --strip-components=1
 fi
-ok "plugin at $(git -C "$PLUGIN_DIR" rev-parse --short HEAD)"
+if [ -d "$PLUGIN_DIR/.git" ]; then
+  ok "plugin at $(git -C "$PLUGIN_DIR" rev-parse --short HEAD)"
+else
+  ok "plugin from PyPI sdist"
+fi
 
 # --------------------------------------------------------------------------
 step "Installing dependencies"
