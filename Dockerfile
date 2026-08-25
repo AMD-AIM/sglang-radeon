@@ -44,7 +44,11 @@ RUN mkdir -p ${SGLANG_SRC} \
 
 COPY . /opt/sglang-radeon
 
-# Everything with --no-deps: SGLang's dependency list hard-codes CUDA
+# Everything SGLang-related with --no-deps, plus a handful of ordinary
+# transitive dependencies (httpx and friends) that --no-deps skips and
+# nothing else pulls in.
+#
+# --no-deps because SGLang's dependency list hard-codes CUDA
 # packages with no platform markers (cuda-python, flashinfer[cu13],
 # nvidia-cutlass-dsl, and sglang-kernel, whose PyPI wheel is CUDA-only and
 # would shadow the kernel we build below). Letting pip resolve them installs
@@ -56,6 +60,7 @@ RUN pip install --no-deps --no-build-isolation -q -e ${SGLANG_SRC}/python \
  && pip install --no-deps --no-build-isolation -q -r /tmp/deps.txt \
  && pip install --no-deps -q "huggingface_hub>=1.0,<2.0" apache-tvm-ffi==0.1.11 \
       kernels_data hf_transfer hf_xet \
+ && pip install -q httpx urllib3 certifi idna sniffio anyio h11 httpcore \
  && pip install --no-deps -q /opt/sglang-radeon \
  && rm -f /tmp/deps.txt
 
@@ -71,21 +76,38 @@ RUN sglang-rdna3 build-kernel \
            ${SGLANG_SRC}/python/sglang/kernels/aot/dist \
  && pip cache purge 2>/dev/null || true
 
-# Fail the build rather than ship an image whose kernel does not load. A
-# CUDA sgl_kernel shows up as ~4 registered architectures instead of ~249.
-RUN python3 - <<'PY'
-import sys
-from sglang.srt.models.registry import ModelRegistry
-import sglang.srt.models.qwen3_5  # noqa: F401  (force discovery)
-n = len(ModelRegistry.models)
-print(f"model architectures registered: {n}")
-if n < 100:
-    sys.exit(f"only {n} architectures registered -- the kernel is not loading")
-import sgl_kernel, torch
-for op in ("gptq_shuffle", "gptq_gemm"):
-    if not hasattr(torch.ops.sgl_kernel, op):
-        sys.exit(f"{op} missing -- the GPTQ patches did not take")
-print("sgl_kernel OK, GPTQ ops present")
+# Fail the build rather than ship an image whose kernel is wrong. This runs
+# on a builder with no GPU, so it checks the artifact rather than the
+# runtime: that sgl_kernel is importable, that its binary really contains
+# code for the target architecture (a CUDA wheel would not), and that the
+# GPTQ ops the patches add are registered.
+#
+# Model-registration count is deliberately not asserted here -- it needs a
+# visible GPU. `sglang-rdna3 doctor` covers that on real hardware.
+ARG AMDGPU_TARGETS
+RUN python3 - "$AMDGPU_TARGETS" <<'PY'
+import glob, os, re, subprocess, sys
+
+target = sys.argv[1] if len(sys.argv) > 1 else "gfx1100"
+
+import sgl_kernel
+pkg = os.path.dirname(sgl_kernel.__file__)
+sos = glob.glob(os.path.join(pkg, "common_ops*.so"))
+if not sos:
+    sys.exit(f"no common_ops*.so in {pkg} -- the kernel did not install")
+
+out = subprocess.run(["strings", sos[0]], capture_output=True, text=True).stdout
+found = sorted(set(re.findall(r"gfx\d+", out)))
+print("kernel targets:", ", ".join(found) or "(none)")
+if target not in found:
+    sys.exit(f"kernel was built for {found}, expected {target}")
+
+import torch
+missing = [op for op in ("gptq_shuffle", "gptq_gemm")
+           if not hasattr(torch.ops.sgl_kernel, op)]
+if missing:
+    sys.exit(f"{', '.join(missing)} not registered -- the GPTQ patches did not take")
+print("sgl_kernel OK: built for", target, "with GPTQ ops")
 PY
 
 WORKDIR /workspace
