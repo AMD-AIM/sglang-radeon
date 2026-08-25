@@ -1,0 +1,1 @@
+import sglang_radeon_rdna3._bootstrap; sglang_radeon_rdna3._bootstrap.bootstrap()
