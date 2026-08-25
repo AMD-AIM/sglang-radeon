@@ -12,9 +12,15 @@ This package closes that gap **from the outside**: it is an ordinary pip
 package that patches nothing in the SGLang tree, so you can upgrade SGLang
 independently.
 
-Validated on 2× Radeon PRO W7900 (gfx1100, 48 GB each), ROCm 7.2.1,
-PyTorch 2.9.1, SGLang `51b27f7`, serving **Qwen3.8-27B** (BF16, TP2) including
-its vision path.
+Validated on Radeon PRO W7900 (gfx1100, 48 GB), ROCm 7.2.1, PyTorch 2.9.1,
+SGLang `51b27f7`:
+
+* **Qwen3.8-27B** — text and vision, both two-GPU BF16 and single-GPU INT4.
+  The 4-bit path fits one card at 19 GB and is *faster* than two cards in
+  BF16 (47.3 vs 32.4 tok/s), since it drops tensor-parallel communication.
+* **MiniMax-H3** — end to end on one GPU: a text prompt yields H.264
+  896×512 @ 24 fps with synchronized AAC stereo audio. Slow (~10 min for a
+  4-second clip), but correct.
 
 ## Quick start
 

@@ -209,3 +209,84 @@ does not point at the cause.
 
 **`kernels_data` is imported by the build but never declared** as a build
 requirement.
+
+---
+
+## 9. Inline PTX in the diffusion Triton kernels
+
+`kernels/ops/diffusion/common/numerics.py` and
+`kernels/ops/diffusion/norm/layernorm_modulate_triton.py` embed PTX assembly
+via `tl.inline_asm_elementwise` — `mul.rn.f32`, `div.rn.f32`,
+`rsqrt.approx.f32`, `rcp.approx.f32`. PTX is NVIDIA-only, so the AMD backend
+fails outright:
+
+```
+error: couldn't allocate output register for constraint 'f'
+```
+
+The intent is bit-exact agreement with CUDA output, which is a reasonable
+goal — but it makes these kernels unbuildable on every non-NVIDIA backend, and
+the error surfaces during VAE decode rather than at compile time, which sends
+you looking in the wrong place entirely.
+
+**Fix:** guard the PTX behind a platform check and fall back to native Triton
+(`x * y`, `x / y`, `tl.rsqrt`, `1.0 / x`) elsewhere. Accuracy differs by at
+most an ulp.
+
+---
+
+## 10. The MiniMax-H3 denoise loop has a CUDA/MPS allowlist
+
+`multimodal_gen/.../minimax_h3/stages/denoising.py:623`:
+
+```python
+if not (current_platform.is_cuda() or current_platform.is_mps()):
+    raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA or MPS")
+```
+
+Everything after this gate is device-agnostic PyTorch, and
+`get_local_torch_device()` already returns `cuda:0` on ROCm since HIP reuses
+the CUDA device namespace. With the gate widened, the loop runs correctly on
+gfx1100 and produces valid H.264 + AAC output.
+
+**Fix:** include ROCm, or test `is_cuda_alike()`, which already treats ROCm as
+CUDA-like elsewhere in this codebase.
+
+---
+
+## 11. `_apply_qk_norm` bypasses its own fallback on ROCm
+
+`multimodal_gen/runtime/models/dits/minimax_h3.py:381`:
+
+```python
+if (q.is_cuda and q.dtype == _BF16_DTYPE and ...):
+    fused_inplace_qknorm(q, k, ...)   # CUDA-only JIT kernel
+    return q, k
+return q_norm(q), k_norm(k)           # unreachable on ROCm
+```
+
+`q.is_cuda` is True for HIP tensors, so ROCm takes the fused path and the JIT
+build fails. The correct fallback is one line below.
+
+**Fix:** test for a compilable kernel rather than for `is_cuda` — e.g. via the
+`can_use_*` predicate the other call sites already use.
+
+---
+
+## 12. Component weights are only discovered one directory deep
+
+`multimodal_gen/runtime/utils/hf_diffusers_utils.py:172`:
+
+```python
+def _has_local_weight_files(component_path):
+    return any(glob.glob(os.path.join(component_path, pattern))
+               for pattern in _WEIGHT_FILE_PATTERNS)
+```
+
+MiniMax-H3 ships its video VAE at `video_vae/source/model.safetensors`, one
+level down, so a complete checkout is judged incomplete. SGLang then tries to
+re-download it, passes the local filesystem path to the Hub API, and fails
+with `HFValidationError: Repo id must be in the form 'repo_name' or
+'namespace/repo_name'` — an error that says nothing about the real problem.
+
+**Fix:** search recursively, or at least one extra level.

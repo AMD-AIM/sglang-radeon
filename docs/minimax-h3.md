@@ -5,11 +5,23 @@ generates video *and* synchronized audio from one packed multimodal sequence,
 served by **SGLang-Diffusion** (`sglang.multimodal_gen`) rather than the
 `sglang.srt` LLM engine. Almost none of the LLM-side guidance transfers.
 
-**Status: the denoising loop runs on gfx1100.** Every stage of the pipeline
-executes and the GPU sits at 95% during denoising. It is, however, *slow* —
-25-65 s per step and degrading, because the 62 GB DiT has to be streamed layer
-by layer from host RAM. Treat this as "the blockers are broken" rather than
-"this is a practical way to generate video today."
+**Status: verified end to end.** A text prompt produces a real video with
+synchronized audio on a single Radeon PRO W7900:
+
+```
+$ ffprobe -v error -show_entries format=duration -show_entries \
+    stream=codec_name,width,height,r_frame_rate,sample_rate,channels ... out.mp4
+codec_name=h264   width=896  height=512  r_frame_rate=24/1
+codec_name=aac    sample_rate=32000  channels=2
+duration=4.458333
+```
+
+The frame content matches the prompt — for "a red balloon drifting over a calm
+lake at sunrise" you get exactly that, with correct water reflections, not
+noise. It is *slow*: expect around 10 minutes for a 4-second clip at
+`short_edge=512` with 8 denoise steps, because the 62 GB DiT streams layer by
+layer from host RAM. Treat this as "it works and the blockers are gone" rather
+than "this is a practical production path today."
 
 Upstream scopes SGLang-Diffusion's AMD support to Instinct only (MI300X /
 MI325X / MI355X). Everything below is what it takes to get past that.
@@ -177,7 +189,91 @@ It does this *in the DiT module only*: patching the kernel globally breaks
 text-encoder construction, which uses the same kernel and has no fallback
 (`Failed to load customized text_encoder; native fallback is disabled`).
 
+## Performance and the offload trade-off
+
+Denoising works but is slow, and the tuning is counterintuitive.
+
+`dit_layerwise_resident_layers` sets what fraction of the 50 DiT blocks stay
+on the GPU. The instinct is to raise it — more resident layers, less paging.
+On a 48 GB card that backfires:
+
+| resident | VRAM during denoise | step time at step 14 | outcome |
+|---|---|---|---|
+| 0.5 | 48.3 GB (full) | 3.96 s | allocator thrashes, then stalls |
+| 0.2 | ~29 GB | 4.21 s | degrades to 105 s/step by step 18 |
+| 0.05 | 18.6 GB | 3.71 s | steady progress |
+
+Activations grow as denoising proceeds, so the resident weights and the
+working set compete for the same 48 GB. Keeping weights *out* of VRAM leaves
+room for the activations and is the faster configuration overall. Start at
+0.05 and only raise it if you have headroom to spare.
+
+Even at the best setting, expect roughly 25 s per step for a 4-second clip at
+`short_edge=768` — about 20 minutes for the 49-step schedule. The bottleneck
+is streaming the 62 GB DiT over PCIe, not compute: the GPU sits at 57-95%
+throughout.
+
+Two things to know when watching a run:
+
+* **Progress-bar output is buffered.** The log can look frozen for minutes
+  while the run is healthy. Check the worker instead — `ps -eo pid,pcpu,stat`
+  should show an `sgl_diffusion::` process at 200%+ in state `Rl`.
+* **Killed runs leave zombies.** Earlier attempts show up as `Z`-state
+  `sgl_diffusion::` processes and will confuse any `pgrep -c` you use to
+  decide whether the run is alive. Match on state, not on count.
+
 ## If you only need a text model
 
 Use Qwen3.8-27B — that path is fully verified and fast. See
 [qwen3.8-27b.md](qwen3.8-27b.md).
+
+## Inline PTX: the last blocker
+
+Several diffusion kernels embed PTX assembly to pin down rounding, e.g.
+`kernels/ops/diffusion/common/numerics.py`:
+
+```python
+@triton.jit
+def mul_rn_f32(x, y):
+    return tl.inline_asm_elementwise(
+        asm="mul.rn.f32 $0, $1, $2;", constraints="=f,f,f", ...)
+```
+
+PTX is NVIDIA's instruction set, so the AMD backend cannot compile any of it:
+
+```
+error: couldn't allocate output register for constraint 'f'
+```
+
+`f` is a PTX float register constraint. This is worth calling out because of
+where it surfaces: three seconds into `MiniMaxH3DecodingStage`, right after
+`[MiniMaxH3DenoisingStage] finished in 182.4302 seconds`. It reads like a
+decode bug and is actually a codegen one.
+
+Four primitives are affected — `mul_rn_f32`, `div_rn_f32`, `rsqrt_approx_f32`
+and `_rcp4`. The plugin swaps in native Triton equivalents (`x * y`, `x / y`,
+`tl.rsqrt`, `1.0 / x`). This gives up the bit-exactness the PTX existed to
+guarantee — these are correctly-rounded and approximate variants chosen to
+match CUDA output exactly — but results stay within an ulp, which is the right
+trade for a platform that otherwise cannot run at all.
+
+Two implementation notes, in case you are patching this yourself:
+
+* **Clear Triton's kernel cache after substituting.** Compiled kernels are
+  keyed on their callees' source, so anything already JIT-compiled keeps
+  calling the old PTX version.
+* **Timing matters.** If `numerics` has not been imported yet there is nothing
+  to patch, and the substitution silently covers fewer functions than you
+  expect.
+
+## One more thing: ffprobe
+
+The final validation step shells out to `ffprobe`:
+
+```
+RuntimeError: ffprobe is required to validate final MiniMax H3 output
+```
+
+The `imageio-ffmpeg` wheel bundles `ffmpeg` but not `ffprobe`, so install the
+system package: `apt-get install -y ffmpeg`. Nothing to do with RDNA3, but it
+lands at the very end of a long run.

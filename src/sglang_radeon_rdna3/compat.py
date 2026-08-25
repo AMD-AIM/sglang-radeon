@@ -355,12 +355,131 @@ def _decline_cuda_only_jit_kernels() -> str:
     return f"applied ({len(patched)} kernel predicates disabled)"
 
 
+# ---------------------------------------------------------------------------
+# Shim 6 -- replace inline PTX in the diffusion Triton kernels.
+#
+# Several diffusion kernels reach for inline PTX to pin down rounding
+# behaviour, e.g. in kernels/ops/diffusion/common/numerics.py:
+#
+#     @triton.jit
+#     def mul_rn_f32(x, y):
+#         return tl.inline_asm_elementwise(
+#             asm="mul.rn.f32 $0, $1, $2;", constraints="=f,f,f", ...)
+#
+# PTX is NVIDIA's instruction set, so the AMD backend cannot compile any of
+# it:
+#
+#     error: couldn't allocate output register for constraint 'f'
+#
+# ('f' is a PTX float register constraint.) This surfaces during VAE decode,
+# after denoising has finished, so it reads like a decode bug rather than a
+# codegen one.
+#
+# Each of these is a plain arithmetic op that Triton expresses natively. We
+# lose the bit-exactness guarantee the PTX was there to provide -- these are
+# "correctly-rounded" and "approximate" variants chosen to match CUDA output
+# exactly -- but the results stay within an ulp, which is the right trade for
+# a platform that otherwise cannot run at all.
+# ---------------------------------------------------------------------------
+def _patch_ptx_primitives() -> str:
+    try:
+        from sglang.srt.utils.common import is_hip
+    except Exception:
+        return "skipped (sglang not available)"
+    if not is_hip():
+        return "not needed (not a HIP platform)"
+
+    try:
+        import triton
+    except Exception:
+        return "skipped (triton not available)"
+
+    @triton.jit
+    def _mul_rn_f32(x, y):
+        return x * y
+
+    @triton.jit
+    def _div_rn_f32(x, y):
+        return x / y
+
+    @triton.jit
+    def _rsqrt_approx_f32(x):
+        return 1.0 / tl_sqrt(x)
+
+    @triton.jit
+    def _rcp4(x):
+        # The PTX was rcp.approx.f32 plus one Newton step; a true divide
+        # matches it to within an ulp.
+        return 1.0 / x
+
+    # tl.sqrt lives at different paths across Triton versions.
+    import triton.language as tl
+
+    tl_sqrt = getattr(tl, "sqrt", None) or getattr(tl.math, "sqrt", None)
+    if tl_sqrt is None:
+        return "skipped (no tl.sqrt in this Triton)"
+
+    @triton.jit
+    def _rsqrt_approx_f32(x):  # noqa: F811 - defined once tl_sqrt is known
+        return tl.rsqrt(x) if hasattr(tl, "rsqrt") else 1.0 / tl.sqrt(x)
+
+    replacements = {
+        "sglang.kernels.ops.diffusion.common.numerics": {
+            "mul_rn_f32": _mul_rn_f32,
+            "div_rn_f32": _div_rn_f32,
+            "rsqrt_approx_f32": _rsqrt_approx_f32,
+        },
+        "sglang.kernels.ops.diffusion.norm.layernorm_modulate_triton": {
+            "_rcp4": _rcp4,
+        },
+    }
+
+    import importlib
+    import sys
+
+    applied = []
+    for mod_path, subs in replacements.items():
+        try:
+            mod = importlib.import_module(mod_path)
+        except Exception:
+            continue
+        if getattr(mod, "_rdna3_ptx_patched", False):
+            applied.append(f"{mod_path.rsplit('.', 1)[-1]}(cached)")
+            continue
+        for name, impl in subs.items():
+            if hasattr(mod, name):
+                setattr(mod, name, impl)
+                applied.append(name)
+        mod._rdna3_ptx_patched = True
+
+        # Rebind copies imported by name into other modules.
+        for other in list(sys.modules.values()):
+            if other is None or other is mod:
+                continue
+            for name, impl in subs.items():
+                if getattr(other, name, None) is not None and hasattr(mod, name):
+                    setattr(other, name, impl)
+
+    # Triton caches compiled kernels keyed on their callees' source.
+    for mod_path in replacements:
+        mod = sys.modules.get(mod_path)
+        for attr in dir(mod) if mod else []:
+            cache = getattr(getattr(mod, attr, None), "cache", None)
+            if isinstance(cache, dict):
+                cache.clear()
+
+    if not applied:
+        return "no PTX primitives found"
+    return f"applied ({len(applied)} primitives)"
+
+
 _SHIMS = (
     ("aiter_gemm_stubs", _stub_aiter_gemm_submodules),
     ("fused_add_rms_norm_arity", _patch_fused_add_rms_norm),
     ("nested_weight_detection", _patch_nested_weight_detection),
     ("h3_denoise_platform_gate", _patch_h3_denoise_platform_gate),
     ("decline_cuda_only_jit_kernels", _decline_cuda_only_jit_kernels),
+    ("ptx_primitives", _patch_ptx_primitives),
 )
 
 
