@@ -23,7 +23,11 @@ jobs:
       # The tests cover the shims and the kernel patches, neither of which
       # needs a GPU -- they exercise the patching logic itself, which is
       # where the subtle bugs live.
-      - run: pip install pytest torch --index-url https://download.pytorch.org/whl/cpu
+      # A CPU build of torch is enough: the tests exercise the patching
+      # logic, not kernels. --extra-index-url, not --index-url, or pip
+      # looks for pytest on the PyTorch index too and fails to find it.
+      - run: pip install pytest
+      - run: pip install torch --extra-index-url https://download.pytorch.org/whl/cpu
       - run: pip install --no-deps -e .
       - run: pytest tests/ -q
 
