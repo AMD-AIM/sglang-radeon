@@ -119,9 +119,248 @@ def _patch_fused_add_rms_norm() -> str:
     return "applied"
 
 
+# ---------------------------------------------------------------------------
+# Shim 3 -- recognize nested component weights (SGLang-Diffusion).
+#
+# multimodal_gen/runtime/utils/hf_diffusers_utils.py checks component
+# completeness with a single-level glob:
+#     glob.glob(os.path.join(component_path, "*.safetensors"))
+# MiniMax-H3 ships its video VAE one level down, at
+#     FL2VA/video_vae/source/model.safetensors
+# so a fully downloaded checkpoint is judged incomplete. SGLang then tries to
+# "repair" it by re-downloading, passes the local path to the Hub API, and
+# dies with a confusing error:
+#     HFValidationError: Repo id must be in the form 'repo_name' or
+#     'namespace/repo_name': '/models/MiniMax-H3/FL2VA'
+#
+# Widening the probe by one directory level is enough. Not RDNA3-specific --
+# it affects anyone serving MiniMax-H3 from a local directory.
+# ---------------------------------------------------------------------------
+def _patch_nested_weight_detection() -> str:
+    try:
+        from sglang.multimodal_gen.runtime.utils import hf_diffusers_utils as hfu
+    except Exception:
+        return "skipped (sglang-diffusion not available)"
+
+    real = getattr(hfu, "_has_local_weight_files", None)
+    if real is None:
+        return "skipped (probe function not found)"
+    if getattr(real, "_rdna3_wrapped", False):
+        return "already applied"
+
+    import glob
+    import os
+
+    patterns = getattr(hfu, "_WEIGHT_FILE_PATTERNS",
+                       ("*.safetensors", "*.bin", "*.pt", "*.pth", "*.ckpt"))
+
+    def _has_local_weight_files(component_path: str) -> bool:
+        if real(component_path):
+            return True
+        # One extra level: enough for layouts like video_vae/source/.
+        return any(
+            glob.glob(os.path.join(component_path, "*", pattern))
+            for pattern in patterns
+        )
+
+    _has_local_weight_files._rdna3_wrapped = True  # type: ignore[attr-defined]
+    hfu._has_local_weight_files = _has_local_weight_files
+    return "applied"
+
+
+# ---------------------------------------------------------------------------
+# Shim 4 -- let the MiniMax-H3 denoise loop run on ROCm.
+#
+# minimax_h3/stages/denoising.py::_run_full_loop gates on a platform
+# allowlist:
+#     if not (current_platform.is_cuda() or current_platform.is_mps()):
+#         raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA or MPS")
+# The code past that gate is device-agnostic PyTorch -- it calls
+# get_local_torch_device() and proceeds. On ROCm that already returns
+# "cuda:0" (HIP reuses the CUDA device namespace), so the loop itself has no
+# CUDA dependency; the allowlist simply predates ROCm support.
+#
+# Rather than patch the function we widen the predicate, by making
+# current_platform.is_cuda() report True on a HIP platform for the duration.
+# That is narrow enough to be safe here: is_cuda_alike() already treats ROCm
+# as CUDA-like elsewhere in the same codebase.
+# ---------------------------------------------------------------------------
+def _patch_h3_denoise_platform_gate() -> str:
+    try:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages import (  # noqa: E501
+            denoising,
+        )
+    except Exception:
+        return "skipped (MiniMax-H3 stages not available)"
+
+    platform = getattr(denoising, "current_platform", None)
+    if platform is None:
+        return "skipped (platform object not found)"
+    if not getattr(platform, "is_hip", lambda: False)():
+        return "not needed (not a HIP platform)"
+    if getattr(platform.is_cuda, "_rdna3_wrapped", False):
+        return "already applied"
+
+    real_is_cuda = platform.is_cuda
+
+    def is_cuda() -> bool:
+        # HIP presents as CUDA to torch; the gate this satisfies only guards
+        # device-agnostic code.
+        return True
+
+    is_cuda._rdna3_wrapped = True  # type: ignore[attr-defined]
+    is_cuda._rdna3_real = real_is_cuda  # type: ignore[attr-defined]
+    try:
+        platform.is_cuda = is_cuda
+    except Exception as exc:
+        return f"FAILED: {exc}"
+    return "applied"
+
+
+# ---------------------------------------------------------------------------
+# Shim 5 -- decline SGLang-Diffusion's CUDA-only JIT kernels on RDNA3.
+#
+# The diffusion denoise path JIT-compiles fused kernels from
+# sglang/kernels/jit/csrc. Thirty-four of those sources hard-include CUDA-only
+# headers (cuda_bf16.h, cuda_fp16.h, cuda_fp8.h) or assume a 32-bit warp mask,
+# so on HIP they fail to compile:
+#
+#     fatal error: 'cuda_bf16.h' file not found
+#     amd_warp_sync_functions.h:277: static assertion failed ...
+#         'sizeof(unsigned int) == 8': The mask must be a 64-bit integer
+#
+# These are real source incompatibilities -- porting them means rewriting the
+# kernels for wave64 and HIP headers, not flipping a flag.
+#
+# Every such kernel is opt-in behind a ``can_use_*`` predicate, and callers
+# fall back to PyTorch reference implementations when one returns False. We
+# therefore report False for the whole family on HIP: slower, but it keeps the
+# pipeline on paths that actually run. Set SGLANG_RDNA3_ALLOW_JIT=1 to leave
+# them enabled (useful for checking whether a kernel has since been ported).
+# ---------------------------------------------------------------------------
+_JIT_OPS_PACKAGE = "sglang.kernels.ops"
+
+#: Functions that dispatch to a CUDA-only JIT kernel behind an `is_cuda`
+#: test, which is True for HIP tensors, and that already contain a correct
+#: PyTorch fallback further down. We replace the dispatcher outright with its
+#: fallback branch.
+#:
+#: Making the kernel itself raise does not work: these call sites have no
+#: try/except, only a condition. And patching the kernel globally breaks
+#: text-encoder construction, where a failure is fatal ("Failed to load
+#: customized text_encoder; native fallback is disabled"). Replacing the one
+#: dispatcher is both sufficient and contained.
+_DISPATCHERS_TO_REPLACE = (
+    ("sglang.multimodal_gen.runtime.models.dits.minimax_h3", "_apply_qk_norm"),
+)
+
+
+def _qk_norm_reference(q, k, q_norm, k_norm, head_dim):
+    """The fallback branch of minimax_h3._apply_qk_norm, verbatim."""
+    return q_norm(q), k_norm(k)
+
+
+def _decline_cuda_only_jit_kernels() -> str:
+    import os
+
+    try:
+        from sglang.srt.utils.common import is_hip
+    except Exception:
+        return "skipped (sglang not available)"
+    if not is_hip():
+        return "not needed (not a HIP platform)"
+    if os.environ.get("SGLANG_RDNA3_ALLOW_JIT", "").lower() in ("1", "true", "yes"):
+        return "disabled via SGLANG_RDNA3_ALLOW_JIT"
+
+    import importlib
+    import pkgutil
+    import sys
+
+    def _false(*_args, **_kwargs) -> bool:
+        return False
+
+    _false._rdna3_wrapped = True  # type: ignore[attr-defined]
+
+    patched: set[str] = set()
+
+    try:
+        root = importlib.import_module(_JIT_OPS_PACKAGE)
+    except Exception as exc:
+        return f"skipped (cannot import {_JIT_OPS_PACKAGE}: {exc})"
+
+    # Walk the ops package and neutralise every can_use_* predicate.
+    for mod_info in pkgutil.walk_packages(root.__path__, root.__name__ + "."):
+        try:
+            module = importlib.import_module(mod_info.name)
+        except Exception:
+            continue  # a module that will not import cannot be used anyway
+        for attr in dir(module):
+            if not attr.startswith("can_use_"):
+                continue
+            fn = getattr(module, attr, None)
+            if callable(fn) and not getattr(fn, "_rdna3_wrapped", False):
+                setattr(module, attr, _false)
+                patched.add(attr)
+
+    # Callers import these by name, so rebind copies already bound elsewhere.
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("sglang.") or module is None:
+            continue
+        for attr in patched:
+            fn = getattr(module, attr, None)
+            if callable(fn) and not getattr(fn, "_rdna3_wrapped", False):
+                setattr(module, attr, _false)
+
+    # Some call sites skip the predicate entirely. MiniMax-H3's DiT, for
+    # instance, gates on `q.is_cuda` -- which is True for HIP tensors, since
+    # torch presents ROCm devices as CUDA -- and calls the kernel directly:
+    #
+    #   minimax_h3.py:381  if (q.is_cuda and q.dtype == _BF16_DTYPE and ...):
+    #   minimax_h3.py:390      fused_inplace_qknorm(...)
+    #   minimax_h3.py:398  return q_norm(q), k_norm(k)   <- the fallback
+    #
+    # There is a perfectly good PyTorch path one line below, but it is
+    # unreachable on ROCm. Making the kernel raise ImportError sends the
+    # caller there, and matches what these wrappers already do when the JIT
+    # build fails for other reasons.
+    for mod_path, attr in _DISPATCHERS_TO_REPLACE:
+        module = sys.modules.get(mod_path)
+        if module is None:
+            try:
+                module = importlib.import_module(mod_path)
+            except Exception:
+                continue
+        fn = getattr(module, attr, None)
+        if fn is None or getattr(fn, "_rdna3_wrapped", False):
+            continue
+
+        _qk_norm_reference._rdna3_wrapped = True  # type: ignore[attr-defined]
+        setattr(module, attr, _qk_norm_reference)
+        patched.add(f"{mod_path.rsplit('.', 1)[-1]}.{attr}")
+
+    if not patched:
+        # Either nothing matched, or a previous call already neutralised
+        # them all -- distinguish, so the status is not misleading.
+        already = sum(
+            1
+            for mod in list(sys.modules.values())
+            if mod is not None
+            for attr in dir(mod)
+            if attr.startswith("can_use_")
+            and getattr(getattr(mod, attr, None), "_rdna3_wrapped", False)
+        )
+        if already:
+            return f"already applied ({already} predicates disabled)"
+        return "no can_use_* predicates found"
+    return f"applied ({len(patched)} kernel predicates disabled)"
+
+
 _SHIMS = (
     ("aiter_gemm_stubs", _stub_aiter_gemm_submodules),
     ("fused_add_rms_norm_arity", _patch_fused_add_rms_norm),
+    ("nested_weight_detection", _patch_nested_weight_detection),
+    ("h3_denoise_platform_gate", _patch_h3_denoise_platform_gate),
+    ("decline_cuda_only_jit_kernels", _decline_cuda_only_jit_kernels),
 )
 
 
