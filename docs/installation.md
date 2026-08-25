@@ -196,3 +196,40 @@ fails, and SGLang falls back to NCCL.
 **Everything hangs, `rocm-smi` included, in uninterruptible `D` state** — not
 software. Suspect the GPU or its driver on that host and try another machine.
 We hit exactly this on one node of the test cluster.
+
+## Networking notes (China and other restricted networks)
+
+GitHub reachability is not uniform, and not even consistent between hosts on
+one network. On our test cluster one node could reach `github.com` while
+another timed out on it but answered on `codeload.github.com`. So:
+
+* **`install.sh` probes and falls back.** If `github.com` is unreachable it
+  tries `ghproxy.net`, `gh-proxy.com`, `ghfast.top` in order.
+  `GITHUB_MIRROR=https://your.proxy` pins one; `GITHUB_MIRROR=none` forces
+  direct.
+* **Mirrors are unreliable for large fetches.** A `git clone` of SGLang
+  through `ghproxy.net` managed 2.8 MB in two minutes, and tarball requests
+  timed out without a status code. Direct `codeload.github.com` did 3.6 MB in
+  30 seconds. The script uses a tarball rather than a clone for exactly this
+  reason — no git history to drag across.
+* **PyPI mirrors work well.** Set `PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple`.
+* **Hugging Face needs a mirror.** `huggingface.co` times out; set
+  `HF_ENDPOINT=https://hf-mirror.com`. With `hf_transfer` enabled, Qwen3.8-27B
+  (54 GB, 18 shards) downloads in about three minutes.
+
+If nothing works, clone on a machine that can reach GitHub, copy the tree
+over, and point the installer at it:
+
+```bash
+SGLANG_SRC=/path/to/sglang bash install.sh
+```
+
+### Why not just install SGLang from PyPI?
+
+It would be much faster — the wheel is 23 MB and lands in under a minute even
+through a domestic mirror, versus minutes for the sources. But the wheel does
+not ship the AoT kernel tree: no `setup_rocm.py`, no `csrc/gemm/gptq`, no
+`common_extension_rocm.cc`. Without those there is no way to build for
+gfx1100, and without that kernel SGLang registers about 4 model architectures
+instead of 249. So the sources are not optional, and installing the Python
+package from the same tarball keeps the two in step.
