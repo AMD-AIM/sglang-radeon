@@ -22,32 +22,62 @@ SGLang `51b27f7`:
   896×512 @ 24 fps with synchronized AAC stereo audio. Slow (~10 min for a
   4-second clip), but correct.
 
-## Quick start
+## Install
+
+### One command
 
 ```bash
-# 1. Install the plugin.
-pip install --no-deps sglang-radeon-rdna3
-
-# 2. Build sgl-kernel for your GPU (SGLang's HIP path hard-requires it and the
-#    PyPI wheel is CUDA-only). Takes a couple of minutes.
-git clone --depth 1 https://github.com/sgl-project/sglang.git
-sglang-rdna3 build-kernel --sglang-src ./sglang --install
-
-# 3. Check everything.
-sglang-rdna3 doctor
-
-# 4. Serve.
-python -m sglang.launch_server \
-  --model-path Qwen/Qwen3.8-27B \
-  --tp-size 2 \
-  --attention-backend triton \
-  --disable-cuda-graph \
-  --dtype bfloat16 \
-  --mem-fraction-static 0.85
+curl -fsSL https://raw.githubusercontent.com/AMD-AIM/sglang-radeon/main/install.sh | bash
 ```
 
-`sglang-rdna3 serve-args <model>` prints a launch line tuned to the GPUs it
-finds.
+Checks your environment, installs SGLang without letting pip replace your
+ROCm PyTorch, builds the gfx1100 kernel, and runs `doctor` at the end. Add
+`--with-diffusion` for MiniMax-H3 video generation.
+
+Behind the GFW it detects that github.com is unreachable and switches to a
+mirror automatically; `GITHUB_MIRROR=https://your.proxy` pins one. Set
+`HF_ENDPOINT=https://hf-mirror.com` before downloading models.
+
+### Docker
+
+```bash
+docker run --rm -it \
+  --device=/dev/kfd --device=/dev/dri --group-add video \
+  --ipc=host --shm-size 16g \
+  -v $HOME/models:/models \
+  ghcr.io/amd-aim/sglang-radeon:latest \
+  sglang-rdna3 doctor
+```
+
+Everything is prebuilt, including the kernel. Note the image is published by
+CI, which has no AMD GPU — run `doctor` once on your hardware before trusting
+it.
+
+### By hand
+
+```bash
+pip install --no-deps sglang-radeon-rdna3
+git clone --depth 1 https://github.com/sgl-project/sglang.git
+sglang-rdna3 build-kernel --sglang-src ./sglang --install
+sglang-rdna3 doctor
+```
+
+`--no-deps` is not optional; see [docs/installation.md](docs/installation.md)
+for why, and for the manual SGLang install that has to accompany it.
+
+## Serve a model
+
+```bash
+# 27B on one 48 GB card, 4-bit — the fastest configuration
+SGLANG_MAMBA_CONV_DTYPE=float16 \
+python -m sglang.launch_server \
+  --model-path palmfuture/Qwen3.8-27B-GPTQ-Int4 \
+  --quantization gptq --dtype float16 \
+  --tp-size 1 --attention-backend triton --disable-cuda-graph \
+  --mem-fraction-static 0.85 --port 30000
+```
+
+`sglang-rdna3 serve-args <model>` prints a command tuned to the GPUs it finds.
 
 ## What `doctor` tells you
 
