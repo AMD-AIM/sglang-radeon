@@ -7,8 +7,17 @@
 # gfx1100 kernel, this plugin -- is handled here. See --help for options.
 set -euo pipefail
 
-REPO_URL="${SGLANG_RDNA3_REPO:-https://github.com/AMD-AIM/sglang-radeon.git}"
-SGLANG_REPO="${SGLANG_REPO:-https://github.com/sgl-project/sglang.git}"
+REPO_SLUG="AMD-AIM/sglang-radeon"
+SGLANG_SLUG="sgl-project/sglang"
+
+# GitHub is unreachable from some networks (notably mainland China), and the
+# reachable set is not consistent even between hosts on one cluster -- we hit
+# a node where github.com timed out but codeload.github.com answered. So we
+# probe rather than assume, and fall back to a mirror.
+#   GITHUB_MIRROR=https://your.proxy   pins one explicitly
+#   GITHUB_MIRROR=none                 forces direct
+GITHUB_MIRROR="${GITHUB_MIRROR:-}"
+MIRROR_CANDIDATES="https://ghproxy.net https://gh-proxy.com https://ghfast.top"
 SGLANG_REF="${SGLANG_REF:-main}"
 WORKDIR="${SGLANG_RDNA3_WORKDIR:-$HOME/.sglang-rdna3}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 8)}"
@@ -53,6 +62,29 @@ step "Checking prerequisites"
 # --------------------------------------------------------------------------
 command -v python3 >/dev/null || die "python3 not found"
 command -v git >/dev/null || die "git not found"
+command -v curl >/dev/null || die "curl not found"
+
+reachable() { curl -fsS -m 8 -o /dev/null "$1" 2>/dev/null; }
+
+if [ -z "$GITHUB_MIRROR" ]; then
+  if reachable https://github.com; then
+    GITHUB_MIRROR=none
+  else
+    for m in $MIRROR_CANDIDATES; do
+      if reachable "$m"; then GITHUB_MIRROR="$m"; break; fi
+    done
+    [ -z "$GITHUB_MIRROR" ] && die "cannot reach github.com or any known mirror.
+  Set GITHUB_MIRROR=https://your.proxy, or clone manually and run
+  install.sh from the checkout."
+  fi
+fi
+if [ "$GITHUB_MIRROR" = "none" ]; then
+  ok "github.com reachable"
+  gh_url() { printf 'https://github.com/%s' "$1"; }
+else
+  ok "using mirror $GITHUB_MIRROR (github.com unreachable)"
+  gh_url() { printf '%s/https://github.com/%s' "$GITHUB_MIRROR" "$1"; }
+fi
 
 PYV=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
 case "$PYV" in
@@ -93,58 +125,85 @@ case "$GFX" in
 esac
 
 # --------------------------------------------------------------------------
-step "Fetching sources into $WORKDIR"
+step "Installing SGLang"
 # --------------------------------------------------------------------------
 mkdir -p "$WORKDIR"
 
-clone_or_update() {  # $1=url $2=dir $3=ref
-  if [ -d "$2/.git" ]; then
-    git -C "$2" fetch --depth 1 origin "$3" -q && git -C "$2" checkout -q FETCH_HEAD
-  else
-    git clone --depth 1 --branch "$3" "$1" "$2" -q 2>/dev/null \
-      || git clone --depth 1 "$1" "$2" -q
+# We need SGLang's sources, not just the package: the published wheel omits
+# the AoT kernel tree (no setup_rocm.py, no csrc/gemm/gptq), and without that
+# there is no way to build for gfx1100. A tarball rather than a clone --
+# same content, none of the ~500 MB of history, which matters a lot on a
+# throttled link.
+#
+# --no-deps throughout: SGLang's dependency list hard-codes CUDA packages
+# with no platform markers, and resolving them installs a CUDA build of
+# PyTorch over the ROCm one.
+
+if [ -n "${SGLANG_SRC:-}" ]; then
+  SGLANG_DIR="$SGLANG_SRC"
+  ok "using existing checkout at $SGLANG_DIR"
+  pip install --no-deps --no-build-isolation -q -e "$SGLANG_DIR/python"
+else
+  SGLANG_DIR="$WORKDIR/sglang-src"
+  if [ ! -f "$SGLANG_DIR/python/sglang/kernels/aot/setup_rocm.py" ]; then
+    rm -rf "$SGLANG_DIR"; mkdir -p "$SGLANG_DIR"
+    TARBALL="$WORKDIR/sglang-src.tar.gz"
+    if [ "$GITHUB_MIRROR" = "none" ]; then
+      TAR_URL="https://codeload.github.com/$SGLANG_SLUG/tar.gz/refs/heads/$SGLANG_REF"
+    else
+      TAR_URL="$GITHUB_MIRROR/https://github.com/$SGLANG_SLUG/archive/refs/heads/$SGLANG_REF.tar.gz"
+    fi
+    echo "  fetching kernel sources (a few minutes on a slow link)..."
+    curl -fsSL --retry 3 -o "$TARBALL" "$TAR_URL" \
+      || die "could not download SGLang sources from $TAR_URL"
+    tar xzf "$TARBALL" -C "$SGLANG_DIR" --strip-components=1
+    rm -f "$TARBALL"
   fi
-}
+  ok "SGLang sources in $SGLANG_DIR"
 
-clone_or_update "$SGLANG_REPO" "$WORKDIR/sglang" "$SGLANG_REF"
-ok "sglang at $(git -C "$WORKDIR/sglang" rev-parse --short HEAD)"
-clone_or_update "$REPO_URL" "$WORKDIR/plugin" main
-ok "plugin at $(git -C "$WORKDIR/plugin" rev-parse --short HEAD)"
+  # Install from the tree we just unpacked, not from PyPI. The wheel is much
+  # faster to fetch, but the kernel we build has to match the Python code it
+  # is loaded by -- and pinning both to one tarball is the only way to be
+  # sure of that. (The AoT sources are absent from the wheel anyway, so the
+  # tarball is not optional.)
+  pip install --no-deps --no-build-isolation -q -e "$SGLANG_DIR/python"
+  ok "sglang (editable, from $SGLANG_REF)"
+fi
+
+# Fetch the plugin itself -- small, so a clone is fine.
+PLUGIN_DIR="$WORKDIR/plugin"
+if [ -d "$PLUGIN_DIR/.git" ]; then
+  git -C "$PLUGIN_DIR" fetch --depth 1 origin main -q && git -C "$PLUGIN_DIR" checkout -q FETCH_HEAD
+else
+  git clone --depth 1 "$(gh_url "$REPO_SLUG").git" "$PLUGIN_DIR" -q
+fi
+ok "plugin at $(git -C "$PLUGIN_DIR" rev-parse --short HEAD)"
 
 # --------------------------------------------------------------------------
-step "Installing SGLang (without its dependency resolver)"
+step "Installing dependencies"
 # --------------------------------------------------------------------------
-# SGLang's dependency list hard-codes CUDA packages with no platform markers
-# (cuda-python, flashinfer[cu13], nvidia-cutlass-dsl, sglang-kernel...). Let
-# pip resolve them and it installs a CUDA build of torch over your ROCm one.
-# So: --no-deps everywhere, then add back what is genuinely needed.
-pip install --no-deps --no-build-isolation -q -e "$WORKDIR/sglang/python"
-ok "sglang (editable, no deps)"
-
 DIFFUSION_FLAG=""
 [ "$WITH_DIFFUSION" = "1" ] && DIFFUSION_FLAG="--diffusion"
-python3 "$WORKDIR/plugin/scripts/filter_deps.py" \
-    --pyproject "$WORKDIR/sglang/python/pyproject.toml" \
+python3 "$PLUGIN_DIR/scripts/filter_deps.py" \
+    --pyproject "$SGLANG_DIR/python/pyproject.toml" \
     --output "$WORKDIR/deps.txt" $DIFFUSION_FLAG
-ok "$(wc -l < "$WORKDIR/deps.txt") dependencies kept, CUDA-only ones dropped"
-
 pip install --no-deps --no-build-isolation -q -r "$WORKDIR/deps.txt"
 
-# --no-deps skips second-order requirements; these three are needed and are
-# not CUDA-specific.
+# --no-deps skips second-order requirements; these are needed and are not
+# CUDA-specific.
 pip install --no-deps -q "huggingface_hub>=1.0,<2.0" apache-tvm-ffi==0.1.11 kernels_data
-ok "runtime dependencies"
+ok "dependencies installed"
 
 # Verify nothing swapped torch out from under us.
 NOW=$(python3 -c 'import torch; print(torch.version.hip or "NOHIP")' 2>/dev/null || echo NOHIP)
 [ "$NOW" = "NOHIP" ] && die "a dependency replaced ROCm PyTorch with a CUDA build.
-  Please report this with the output above."
+  Please report this along with the output above."
 ok "ROCm PyTorch intact"
 
 # --------------------------------------------------------------------------
 step "Installing the RDNA3 plugin"
 # --------------------------------------------------------------------------
-pip install --no-deps -q "$WORKDIR/plugin"
+pip install --no-deps -q "$PLUGIN_DIR"
 ok "sglang-radeon-rdna3"
 
 # --------------------------------------------------------------------------
@@ -153,7 +212,7 @@ step "Building sgl-kernel for $GFX (a few minutes)"
 # --------------------------------------------------------------------------
   # The PyPI 'sglang-kernel' wheel is CUDA-only and would shadow our build.
   pip uninstall -y -q sglang-kernel 2>/dev/null || true
-  sglang-rdna3 build-kernel --sglang-src "$WORKDIR/sglang" --jobs "$JOBS" --install
+  sglang-rdna3 build-kernel --sglang-src "$SGLANG_DIR" --jobs "$JOBS" --install
 else
   warn "skipping kernel build: expect very few model architectures to register"
 fi
@@ -170,8 +229,8 @@ $GREEN$BOLD Ready. $OFF
     ${BOLD}sglang-rdna3 serve-args Qwen/Qwen3.8-27B${OFF}
 
   Docs:
-    $WORKDIR/plugin/docs/qwen3.8-27b.md
-    $WORKDIR/plugin/docs/minimax-h3.md
+    $PLUGIN_DIR/docs/qwen3.8-27b.md
+    $PLUGIN_DIR/docs/minimax-h3.md
 EOF
 else
   die "doctor reported problems — see above"
