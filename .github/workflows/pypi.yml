@@ -1,0 +1,41 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # for PyPI trusted publishing -- no API token needed
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # The tests cover the shims and the kernel patches, neither of which
+      # needs a GPU -- they exercise the patching logic itself, which is
+      # where the subtle bugs live.
+      - run: pip install pytest torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install --no-deps -e .
+      - run: pytest tests/ -q
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build
+      - uses: pypa/gh-action-pypi-publish@release/v1
