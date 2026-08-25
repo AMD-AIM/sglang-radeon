@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write   # for PyPI trusted publishing -- no API token needed
 
 jobs:
   test:
@@ -43,3 +42,5 @@ jobs:
       - run: pip install build
       - run: python -m build
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}

@@ -53,17 +53,26 @@ Everything is prebuilt, including the kernel. Note the image is published by
 CI, which has no AMD GPU — run `doctor` once on your hardware before trusting
 it.
 
-### By hand
+### From PyPI
+
+The plugin itself is on PyPI:
 
 ```bash
 pip install --no-deps sglang-radeon-rdna3
+```
+
+`--no-deps` is not optional — see [docs/installation.md](docs/installation.md)
+for why. This gets you the shims and the `sglang-rdna3` CLI, but not SGLang
+and not the kernel, so follow with:
+
+```bash
 git clone --depth 1 https://github.com/sgl-project/sglang.git
 sglang-rdna3 build-kernel --sglang-src ./sglang --install
 sglang-rdna3 doctor
 ```
 
-`--no-deps` is not optional; see [docs/installation.md](docs/installation.md)
-for why, and for the manual SGLang install that has to accompany it.
+The kernel has to be compiled against your GPU and cannot ship as a wheel;
+`install.sh` above does all of this for you.
 
 ## Serve a model
 
