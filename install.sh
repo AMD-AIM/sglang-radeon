@@ -214,11 +214,26 @@ if [ "$FROM_SOURCE" = "0" ] && [ -z "${SGLANG_SRC:-}" ]; then
     || die "could not install sglang from PyPI. Retry, or use --from-source."
   ok "sglang $(python3 -c 'import importlib.metadata as m; print(m.version("sglang"))' 2>/dev/null)"
 
-  if pip install --no-deps -q "sglang-kernel-rdna3${KERNEL_PIN:-}" 2>/dev/null; then
-    ok "prebuilt gfx1100 kernel"
-    PREBUILT_KERNEL=1
-  else
-    warn "no prebuilt kernel available; falling back to building from source"
+  # Mirrors lag behind PyPI by minutes to hours, and a freshly published
+  # wheel may be on one and not another -- we saw exactly that: tencent had
+  # it, tuna and aliyun did not, yet. So try each index in turn rather than
+  # concluding from one miss that no build exists.
+  PREBUILT_KERNEL=0
+  for idx in "${PIP_INDEX_URL:-https://pypi.org/simple}" \
+             https://mirrors.cloud.tencent.com/pypi/simple \
+             https://pypi.tuna.tsinghua.edu.cn/simple \
+             https://mirrors.aliyun.com/pypi/simple \
+             https://pypi.org/simple; do
+    if pip install --no-deps -q -i "$idx" "sglang-kernel-rdna3${KERNEL_PIN:-}" \
+         2>/dev/null; then
+      ok "prebuilt gfx1100 kernel (from ${idx#https://})"
+      PREBUILT_KERNEL=1
+      break
+    fi
+  done
+  if [ "$PREBUILT_KERNEL" = "0" ]; then
+    warn "no prebuilt kernel found on any index; building from source instead
+        (this needs a ~125 MB download and a compiler)"
     FROM_SOURCE=1
   fi
 fi
