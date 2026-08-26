@@ -66,24 +66,31 @@ command -v curl >/dev/null || die "curl not found"
 
 reachable() { curl -fsS -m 8 -o /dev/null "$1" 2>/dev/null; }
 
+# Probe codeload, not github.com. We fetch sources as tarballs, and those
+# come from codeload.github.com -- which on several networks answers when
+# github.com itself does not. Testing the wrong host sends us to a mirror
+# unnecessarily, or fails outright when the mirrors are blocked too.
 if [ -z "$GITHUB_MIRROR" ]; then
-  if reachable https://github.com; then
+  if reachable "https://codeload.github.com/$REPO_SLUG/tar.gz/refs/heads/main"; then
     GITHUB_MIRROR=none
   else
     for m in $MIRROR_CANDIDATES; do
       if reachable "$m"; then GITHUB_MIRROR="$m"; break; fi
     done
-    [ -z "$GITHUB_MIRROR" ] && die "cannot reach github.com or any known mirror.
-  Set GITHUB_MIRROR=https://your.proxy, or clone manually and run
-  install.sh from the checkout."
+    [ -z "$GITHUB_MIRROR" ] && die "cannot reach codeload.github.com or any known mirror.
+  Options:
+    - set GITHUB_MIRROR=https://your.proxy
+    - fetch the sources elsewhere and pass SGLANG_SRC=/path/to/sglang
+    - pip download --no-deps --no-binary :all: sglang-radeon-rdna3
+      (the sdist carries this installer and its helpers)"
   fi
 fi
 if [ "$GITHUB_MIRROR" = "none" ]; then
-  ok "github.com reachable"
-  gh_url() { printf 'https://github.com/%s' "$1"; }
+  ok "codeload.github.com reachable"
+  tar_url() { printf 'https://codeload.github.com/%s/tar.gz/refs/heads/%s' "$1" "$2"; }
 else
-  ok "using mirror $GITHUB_MIRROR (github.com unreachable)"
-  gh_url() { printf '%s/https://github.com/%s' "$GITHUB_MIRROR" "$1"; }
+  ok "using mirror $GITHUB_MIRROR"
+  tar_url() { printf '%s/https://github.com/%s/archive/refs/heads/%s.tar.gz' "$GITHUB_MIRROR" "$1" "$2"; }
 fi
 
 PYV=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
@@ -148,11 +155,7 @@ else
   if [ ! -f "$SGLANG_DIR/python/sglang/kernels/aot/setup_rocm.py" ]; then
     rm -rf "$SGLANG_DIR"; mkdir -p "$SGLANG_DIR"
     TARBALL="$WORKDIR/sglang-src.tar.gz"
-    if [ "$GITHUB_MIRROR" = "none" ]; then
-      TAR_URL="https://codeload.github.com/$SGLANG_SLUG/tar.gz/refs/heads/$SGLANG_REF"
-    else
-      TAR_URL="$GITHUB_MIRROR/https://github.com/$SGLANG_SLUG/archive/refs/heads/$SGLANG_REF.tar.gz"
-    fi
+    TAR_URL="$(tar_url "$SGLANG_SLUG" "$SGLANG_REF")"
     echo "  fetching kernel sources (a few minutes on a slow link)..."
     curl -fsSL --retry 3 -o "$TARBALL" "$TAR_URL" \
       || die "could not download SGLang sources from $TAR_URL"
@@ -173,27 +176,30 @@ fi
 # The plugin. We still want the repo for scripts/filter_deps.py and the
 # docs, but PyPI is a faster and more reliable source for the package itself
 # on networks where GitHub is slow.
+# A tarball, not a clone: git needs github.com, which is blocked on more
+# networks than codeload is. PyPI's sdist is the second fallback -- it
+# carries this installer and scripts/ as well as the package.
 PLUGIN_DIR="$WORKDIR/plugin"
-if [ -d "$PLUGIN_DIR/.git" ]; then
-  git -C "$PLUGIN_DIR" fetch --depth 1 origin main -q 2>/dev/null \
-    && git -C "$PLUGIN_DIR" checkout -q FETCH_HEAD
-elif git clone --depth 1 "$(gh_url "$REPO_SLUG").git" "$PLUGIN_DIR" -q 2>/dev/null; then
-  :
+PLUGIN_SOURCE=""
+if [ ! -f "$PLUGIN_DIR/scripts/filter_deps.py" ]; then
+  rm -rf "$PLUGIN_DIR"; mkdir -p "$PLUGIN_DIR"
+  if curl -fsSL --retry 2 -o "$WORKDIR/plugin.tar.gz" \
+        "$(tar_url "$REPO_SLUG" main)" 2>/dev/null; then
+    tar xzf "$WORKDIR/plugin.tar.gz" -C "$PLUGIN_DIR" --strip-components=1
+    rm -f "$WORKDIR/plugin.tar.gz"
+    PLUGIN_SOURCE="github"
+  elif pip download --no-deps --no-binary :all: -d "$WORKDIR/sdist" \
+          sglang-radeon-rdna3 -q 2>/dev/null; then
+    tar xzf "$WORKDIR"/sdist/sglang_radeon_rdna3-*.tar.gz \
+        -C "$PLUGIN_DIR" --strip-components=1
+    PLUGIN_SOURCE="pypi"
+  else
+    die "could not obtain the plugin from GitHub or PyPI"
+  fi
 else
-  # Fall back to the sdist, which carries the scripts and docs too.
-  warn "could not clone the plugin repo; fetching the sdist from PyPI"
-  mkdir -p "$PLUGIN_DIR"
-  pip download --no-deps --no-binary :all: -d "$WORKDIR/sdist" \
-      sglang-radeon-rdna3 -q \
-    || die "could not obtain the plugin from GitHub or PyPI"
-  tar xzf "$WORKDIR"/sdist/sglang_radeon_rdna3-*.tar.gz \
-      -C "$PLUGIN_DIR" --strip-components=1
+  PLUGIN_SOURCE="cached"
 fi
-if [ -d "$PLUGIN_DIR/.git" ]; then
-  ok "plugin at $(git -C "$PLUGIN_DIR" rev-parse --short HEAD)"
-else
-  ok "plugin from PyPI sdist"
-fi
+ok "plugin sources ($PLUGIN_SOURCE)"
 
 # --------------------------------------------------------------------------
 step "Installing dependencies"
