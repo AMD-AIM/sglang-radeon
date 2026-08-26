@@ -30,6 +30,8 @@ WORKDIR="${SGLANG_RDNA3_WORKDIR:-$HOME/.sglang-rdna3}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 8)}"
 WITH_DIFFUSION=0
 SKIP_KERNEL=0
+FROM_SOURCE=0
+PREBUILT_KERNEL=0
 
 RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BOLD=$'\033[1m'; OFF=$'\033[0m'
 
@@ -49,6 +51,8 @@ Usage: install.sh [options]
 
   --with-diffusion   Also install the extras for MiniMax-H3 video generation
   --skip-kernel      Do not build sgl-kernel (you will have almost no models)
+  --from-source      Build from SGLang's sources instead of installing the
+                     prebuilt wheels (needs a ~125 MB download and a compiler)
   --workdir DIR      Where to check out sources (default: ~/.sglang-rdna3)
   --jobs N           Parallel compile jobs (default: nproc)
   -h, --help         This message
@@ -63,6 +67,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --with-diffusion) WITH_DIFFUSION=1; shift ;;
     --skip-kernel)    SKIP_KERNEL=1; shift ;;
+    --from-source)    FROM_SOURCE=1; shift ;;
     --workdir)        WORKDIR="$2"; shift 2 ;;
     --jobs)           JOBS="$2"; shift 2 ;;
     -h|--help)        usage; exit 0 ;;
@@ -185,16 +190,40 @@ step "Installing SGLang"
 # --------------------------------------------------------------------------
 mkdir -p "$WORKDIR"
 
-# We need SGLang's sources, not just the package: the published wheel omits
-# the AoT kernel tree (no setup_rocm.py, no csrc/gemm/gptq), and without that
-# there is no way to build for gfx1100. A tarball rather than a clone --
-# same content, none of the ~500 MB of history, which matters a lot on a
-# throttled link.
+# Two routes, and the fast one avoids sources entirely.
+#
+# Building the kernel needs SGLang's AoT tree, which the published wheel
+# omits -- so historically this meant fetching ~125 MB of sources. On a link
+# that cannot hold a large transfer open, that download simply never
+# completes: neither codeload.github.com nor the usual mirrors honour Range
+# requests, so a dropped connection restarts from zero and you can loop
+# forever. Retries do not help when the link cannot sustain the transfer.
+#
+# So by default we install a *prebuilt* kernel from PyPI (~5 MB) alongside
+# SGLang's own wheel (~23 MB), and never touch the sources. --from-source
+# forces the old path, for people who want to build against a specific
+# commit.
 #
 # --no-deps throughout: SGLang's dependency list hard-codes CUDA packages
 # with no platform markers, and resolving them installs a CUDA build of
 # PyTorch over the ROCm one.
 
+if [ "$FROM_SOURCE" = "0" ] && [ -z "${SGLANG_SRC:-}" ]; then
+  echo "  installing from wheels (no source download, no compiler)"
+  pip install --no-deps -q "sglang==${SGLANG_VERSION:-0.5.18}" \
+    || die "could not install sglang from PyPI. Retry, or use --from-source."
+  ok "sglang $(python3 -c 'import importlib.metadata as m; print(m.version("sglang"))' 2>/dev/null)"
+
+  if pip install --no-deps -q "sglang-kernel-rdna3${KERNEL_PIN:-}" 2>/dev/null; then
+    ok "prebuilt gfx1100 kernel"
+    PREBUILT_KERNEL=1
+  else
+    warn "no prebuilt kernel available; falling back to building from source"
+    FROM_SOURCE=1
+  fi
+fi
+
+if [ "$FROM_SOURCE" = "1" ] || [ -n "${SGLANG_SRC:-}" ]; then
 if [ -n "${SGLANG_SRC:-}" ]; then
   SGLANG_DIR="$SGLANG_SRC"
   ok "using existing checkout at $SGLANG_DIR"
@@ -221,13 +250,12 @@ else
   fi
   ok "SGLang sources in $SGLANG_DIR"
 
-  # Install from the tree we just unpacked, not from PyPI. The wheel is much
-  # faster to fetch, but the kernel we build has to match the Python code it
-  # is loaded by -- and pinning both to one tarball is the only way to be
-  # sure of that. (The AoT sources are absent from the wheel anyway, so the
-  # tarball is not optional.)
+  # Install from the tree we just unpacked, not from PyPI: the kernel we
+  # build has to match the Python code that loads it, and pinning both to one
+  # tarball is the only way to be sure of that.
   pip install --no-deps --no-build-isolation -q -e "$SGLANG_DIR/python"
   ok "sglang (editable, from $SGLANG_REF)"
+fi
 fi
 
 # The plugin. We still want the repo for scripts/filter_deps.py and the
@@ -263,9 +291,15 @@ step "Installing dependencies"
 # --------------------------------------------------------------------------
 DIFFUSION_FLAG=""
 [ "$WITH_DIFFUSION" = "1" ] && DIFFUSION_FLAG="--diffusion"
-python3 "$PLUGIN_DIR/scripts/filter_deps.py" \
-    --pyproject "$SGLANG_DIR/python/pyproject.toml" \
-    --output "$WORKDIR/deps.txt" $DIFFUSION_FLAG
+if [ -n "${SGLANG_DIR:-}" ] && [ -f "$SGLANG_DIR/python/pyproject.toml" ]; then
+  python3 "$PLUGIN_DIR/scripts/filter_deps.py" \
+      --pyproject "$SGLANG_DIR/python/pyproject.toml" \
+      --output "$WORKDIR/deps.txt" $DIFFUSION_FLAG
+else
+  # No source tree: the installed wheel's metadata carries the same list.
+  python3 "$PLUGIN_DIR/scripts/filter_deps.py" \
+      --installed sglang --output "$WORKDIR/deps.txt" $DIFFUSION_FLAG
+fi
 pip install --no-deps --no-build-isolation -q -r "$WORKDIR/deps.txt"
 
 # --no-deps skips second-order requirements; these are needed and are not
@@ -286,7 +320,10 @@ pip install --no-deps -q "$PLUGIN_DIR"
 ok "sglang-radeon-rdna3"
 
 # --------------------------------------------------------------------------
-if [ "$SKIP_KERNEL" = "0" ]; then
+if [ "$PREBUILT_KERNEL" = "1" ]; then
+step "Kernel"
+  ok "using the prebuilt gfx1100 wheel (nothing to compile)"
+elif [ "$SKIP_KERNEL" = "0" ]; then
 step "Building sgl-kernel for $GFX (a few minutes)"
 # --------------------------------------------------------------------------
   # The PyPI 'sglang-kernel' wheel is CUDA-only and would shadow our build.

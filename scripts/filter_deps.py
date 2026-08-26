@@ -84,23 +84,44 @@ def filter_requirements(specs, exclude) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--pyproject", required=True,
-                    help="Path to sglang/python/pyproject.toml")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--pyproject",
+                     help="Path to sglang/python/pyproject.toml")
+    src.add_argument("--installed", metavar="PACKAGE",
+                     help="Read requirements from an installed distribution "
+                          "instead -- the wheel carries the same list, so "
+                          "this works without a source checkout")
     ap.add_argument("--output", help="Write here instead of stdout")
     ap.add_argument("--diffusion", action="store_true",
                     help="Also emit the diffusion extras (for MiniMax-H3)")
     ap.add_argument("--show-dropped", action="store_true")
     args = ap.parse_args(argv)
 
-    with open(args.pyproject, "rb") as fh:
-        project = tomllib.load(fh)["project"]
-
     exclude = set(EXCLUDE)
-    specs = list(project["dependencies"])
-    if args.diffusion:
-        extras = project.get("optional-dependencies", {}).get("diffusion", [])
-        specs += extras
-        exclude |= EXCLUDE_DIFFUSION
+
+    if args.installed:
+        import importlib.metadata as md
+
+        raw = md.requires(args.installed) or []
+        # Requirements from metadata carry environment markers; keep the
+        # base requirement and let the diffusion extra in only if asked.
+        specs = []
+        for req in raw:
+            base, _, marker = req.partition(";")
+            if "extra ==" in marker:
+                if args.diffusion and "diffusion" in marker:
+                    specs.append(base.strip())
+                continue
+            specs.append(base.strip())
+        if args.diffusion:
+            exclude |= EXCLUDE_DIFFUSION
+    else:
+        with open(args.pyproject, "rb") as fh:
+            project = tomllib.load(fh)["project"]
+        specs = list(project["dependencies"])
+        if args.diffusion:
+            specs += project.get("optional-dependencies", {}).get("diffusion", [])
+            exclude |= EXCLUDE_DIFFUSION
 
     kept = filter_requirements(specs, exclude)
     dropped = [s for s in specs if requirement_name(s) in exclude]
