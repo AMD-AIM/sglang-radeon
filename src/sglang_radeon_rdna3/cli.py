@@ -76,6 +76,49 @@ def _check_sgl_kernel() -> tuple[str, str]:
     return _OK, f"sgl_kernel built for {', '.join(targets)}"
 
 
+def _check_sglang_import() -> tuple[str, str]:
+    """Catch a `sglang/` directory in the cwd shadowing the real package.
+
+    Python treats any directory named `sglang` as a namespace package, so
+    cloning SGLang into your working directory makes `import sglang` resolve
+    to the checkout root -- which has no modules in it. Everything installs
+    cleanly and then `python -m sglang.launch_server` reports
+    "No module named sglang.launch_server", which points nowhere useful.
+    """
+    import os
+
+    try:
+        import sglang
+    except Exception as exc:
+        return _BAD, f"cannot import sglang ({type(exc).__name__}: {exc})"
+
+    path = getattr(sglang, "__file__", None)
+    if path is None:
+        where = ", ".join(getattr(sglang, "__path__", []) or ["?"])
+        return _BAD, (
+            f"'import sglang' resolved to the directory {where}, not to the "
+            "installed package -- a folder named 'sglang' is shadowing it.\n"
+            "        cd somewhere else, or move that directory."
+        )
+
+    # A console script puts its own bin/ first on sys.path, so this process is
+    # immune to cwd shadowing even when `python -m sglang.launch_server` in
+    # the same directory is not. Check the filesystem rather than our own
+    # import, or we would cheerfully report success on a broken shell.
+    shadow = os.path.join(os.getcwd(), "sglang")
+    if os.path.isdir(shadow) and not os.path.samefile(
+        shadow, os.path.dirname(path)
+    ):
+        return _WARN, (
+            f"sglang imports fine here, but {shadow} will shadow it for\n"
+            "        'python -m sglang.launch_server' run from this "
+            "directory, which fails with\n"
+            "        'No module named sglang.launch_server'. cd elsewhere "
+            "before serving."
+        )
+    return _OK, f"sglang from {os.path.dirname(path)}"
+
+
 def _check_platform() -> tuple[str, str]:
     try:
         from sglang.srt.utils.common import is_cuda, is_hip
@@ -127,6 +170,7 @@ def cmd_doctor(_args) -> int:
 
     print()
     for status, msg in (
+        _check_sglang_import(),
         _check_sgl_kernel(),
         _check_platform(),
         _check_attention_backends(),

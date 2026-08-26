@@ -164,6 +164,33 @@ Qwen3.8-27B (54 GB, 18 shards) downloads in about three minutes this way.
 
 ## Troubleshooting
 
+## `No module named sglang.launch_server`
+
+If you cloned SGLang into your working directory, Python resolves
+`import sglang` to that folder as a namespace package rather than to the
+installed one. Everything installs cleanly and then:
+
+```
+/opt/venv/bin/python3: No module named sglang.launch_server
+```
+
+Diagnose it:
+
+```bash
+python3 -c "import sglang; print(sglang.__file__)"
+```
+
+* A path under `site-packages` or your source checkout's `python/` — fine.
+* `AttributeError: module 'sglang' has no attribute '__file__'` — you have hit
+  this. The import found a directory, not a package.
+
+Fix: `cd` out of the directory containing `sglang/`, or clone somewhere that
+is not your working directory. `install.sh` clones into `~/.sglang-rdna3` for
+this reason.
+
+The same shadowing catches you if a stray `sglang/` directory is left behind
+by an interrupted download.
+
 **`ModuleNotFoundError: No module named 'aiter.ops.triton.gemm'`** — the
 plugin is not active. Check `sglang-rdna3 doctor`; if the shims show as not
 applied, the `.pth` file did not install. Copy it manually:

@@ -28,7 +28,7 @@ from sglang_radeon_rdna3.hardware import (
     recommended_server_args,
 )
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 __all__ = [
     "GpuInfo",
