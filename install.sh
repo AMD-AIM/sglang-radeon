@@ -18,6 +18,13 @@ SGLANG_SLUG="sgl-project/sglang"
 #   GITHUB_MIRROR=none                 forces direct
 GITHUB_MIRROR="${GITHUB_MIRROR:-}"
 MIRROR_CANDIDATES="https://ghproxy.net https://gh-proxy.com https://ghfast.top"
+
+# Same story for PyPI: pypi.org is blocked on plenty of networks where the
+# domestic mirrors are fine. PIP_INDEX_URL, if you already have one set, is
+# left alone.
+PIP_MIRROR_CANDIDATES="https://pypi.tuna.tsinghua.edu.cn/simple
+https://mirrors.aliyun.com/pypi/simple
+https://mirrors.cloud.tencent.com/pypi/simple"
 SGLANG_REF="${SGLANG_REF:-main}"
 WORKDIR="${SGLANG_RDNA3_WORKDIR:-$HOME/.sglang-rdna3}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 8)}"
@@ -91,6 +98,23 @@ if [ "$GITHUB_MIRROR" = "none" ]; then
 else
   ok "using mirror $GITHUB_MIRROR"
   tar_url() { printf '%s/https://github.com/%s/archive/refs/heads/%s.tar.gz' "$GITHUB_MIRROR" "$1" "$2"; }
+fi
+
+if [ -n "${PIP_INDEX_URL:-}" ]; then
+  ok "pip index: $PIP_INDEX_URL (from your environment)"
+elif reachable https://pypi.org/simple/; then
+  ok "pypi.org reachable"
+else
+  for m in $PIP_MIRROR_CANDIDATES; do
+    if reachable "$m/"; then
+      export PIP_INDEX_URL="$m"
+      export PIP_TRUSTED_HOST="$(printf '%s' "$m" | sed -E 's#https?://([^/]+).*#\1#')"
+      ok "pypi.org unreachable; using $m"
+      break
+    fi
+  done
+  [ -z "${PIP_INDEX_URL:-}" ] && die "cannot reach pypi.org or any known mirror.
+  Set PIP_INDEX_URL to an index you can reach and re-run."
 fi
 
 PYV=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
