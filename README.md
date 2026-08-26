@@ -32,11 +32,23 @@ curl -fsSL https://raw.githubusercontent.com/AMD-AIM/sglang-radeon/main/install.
 
 Checks your environment, installs SGLang without letting pip replace your
 ROCm PyTorch, builds the gfx1100 kernel, and runs `doctor` at the end. Add
-`--with-diffusion` for MiniMax-H3 video generation.
+`--with-diffusion` for MiniMax-H3 video generation. Re-running it is safe.
 
-Behind the GFW it detects that github.com is unreachable and switches to a
-mirror automatically; `GITHUB_MIRROR=https://your.proxy` pins one. Set
-`HF_ENDPOINT=https://hf-mirror.com` before downloading models.
+It probes for what it can actually reach — `codeload.github.com` for sources,
+`pypi.org` or a domestic mirror for packages — and says which it picked:
+
+```
+==> Checking prerequisites
+  ✓ codeload.github.com reachable
+  ✓ pypi.org unreachable; using https://pypi.tuna.tsinghua.edu.cn/simple
+  ✓ PyTorch 2.9.1+gitff65f5b (HIP 7.2.53211-e1a6bc5663)
+  ✓ GPU: gfx1100 (RDNA3)
+```
+
+`GITHUB_MIRROR` and `PIP_INDEX_URL` override the choice. Verified end to end
+on a bare machine with no pre-staged sources and neither variable set.
+
+Set `HF_ENDPOINT=https://hf-mirror.com` before downloading models.
 
 ### Docker
 
