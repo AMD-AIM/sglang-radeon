@@ -32,6 +32,12 @@ WITH_DIFFUSION=0
 SKIP_KERNEL=0
 
 RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BOLD=$'\033[1m'; OFF=$'\033[0m'
+
+# pip's defaults are tuned for a reliable link. On a lossy one, installing
+# sixty-odd packages will hit at least one reset, and the default of five
+# retries with no timeout bump is not enough.
+export PIP_RETRIES="${PIP_RETRIES:-10}"
+export PIP_TIMEOUT="${PIP_TIMEOUT:-60}"
 step() { printf '\n%s==> %s%s\n' "$BOLD" "$*" "$OFF"; }
 ok()   { printf '  %s✓%s %s\n' "$GREEN" "$OFF" "$*"; }
 warn() { printf '  %s!%s %s\n' "$YELLOW" "$OFF" "$*"; }
@@ -72,6 +78,25 @@ command -v git >/dev/null || die "git not found"
 command -v curl >/dev/null || die "curl not found"
 
 reachable() { curl -fsS -m 8 -o /dev/null "$1" 2>/dev/null; }
+
+# Downloads here are large (SGLang's sources are ~125 MB) and the links this
+# is meant for are slow and lossy. Slow is fine; giving up is not.
+#
+#   --retry-all-errors  retry on connection resets, not just HTTP 5xx
+#   --speed-limit/-time abandon a connection that has stalled below 1 KB/s
+#                       for 30 s, so a retry can start rather than hanging
+#                       until the server eventually drops it
+#   no -m               there is no sensible overall timeout for a download
+#                       that may legitimately take twenty minutes
+#
+# Note neither codeload.github.com nor the usual mirrors honour Range
+# requests -- both answer 200 and restart -- so `curl -C -` cannot resume and
+# each retry starts over. Hence the generous retry count.
+fetch() {  # fetch <url> <dest>
+  curl -fL --retry 10 --retry-all-errors --retry-delay 3 \
+       --speed-limit 1024 --speed-time 30 \
+       --progress-bar -o "$2" "$1"
+}
 
 # Probe codeload, not github.com. We fetch sources as tarballs, and those
 # come from codeload.github.com -- which on several networks answers when
@@ -180,9 +205,17 @@ else
     rm -rf "$SGLANG_DIR"; mkdir -p "$SGLANG_DIR"
     TARBALL="$WORKDIR/sglang-src.tar.gz"
     TAR_URL="$(tar_url "$SGLANG_SLUG" "$SGLANG_REF")"
-    echo "  fetching kernel sources (a few minutes on a slow link)..."
-    curl -fsSL --retry 3 -o "$TARBALL" "$TAR_URL" \
-      || die "could not download SGLang sources from $TAR_URL"
+    echo "  fetching SGLang sources (~125 MB; minutes on a slow link,"
+    echo "  and it will retry rather than give up)"
+    fetch "$TAR_URL" "$TARBALL" || die "could not download SGLang sources.
+  Tried: $TAR_URL
+  If your link keeps dropping, fetch it somewhere else and re-run with
+    SGLANG_SRC=/path/to/sglang bash install.sh"
+    # A truncated tarball is worse than none: it unpacks partially and the
+    # build fails somewhere confusing.
+    tar tzf "$TARBALL" >/dev/null 2>&1 \
+      || die "the downloaded archive is corrupt (likely a truncated
+  transfer). Delete $WORKDIR and re-run."
     tar xzf "$TARBALL" -C "$SGLANG_DIR" --strip-components=1
     rm -f "$TARBALL"
   fi
@@ -207,8 +240,8 @@ PLUGIN_DIR="$WORKDIR/plugin"
 PLUGIN_SOURCE=""
 if [ ! -f "$PLUGIN_DIR/scripts/filter_deps.py" ]; then
   rm -rf "$PLUGIN_DIR"; mkdir -p "$PLUGIN_DIR"
-  if curl -fsSL --retry 2 -o "$WORKDIR/plugin.tar.gz" \
-        "$(tar_url "$REPO_SLUG" main)" 2>/dev/null; then
+  if fetch "$(tar_url "$REPO_SLUG" main)" "$WORKDIR/plugin.tar.gz" 2>/dev/null \
+     && tar tzf "$WORKDIR/plugin.tar.gz" >/dev/null 2>&1; then
     tar xzf "$WORKDIR/plugin.tar.gz" -C "$PLUGIN_DIR" --strip-components=1
     rm -f "$WORKDIR/plugin.tar.gz"
     PLUGIN_SOURCE="github"
