@@ -5,6 +5,8 @@ applying twice, misreporting an unpatched file as done, and silently doing
 nothing when upstream moves. All three are covered here.
 """
 
+import types
+
 import pytest
 
 from sglang_radeon_rdna3 import kernel_patches as kp
@@ -15,14 +17,29 @@ def aot(tmp_path):
     """A minimal stand-in for the AoT build tree."""
     (tmp_path / "csrc" / "gemm" / "gptq").mkdir(parents=True)
 
+    # Kept verbatim-ish from upstream: these are the exact strings the patches
+    # anchor on, so a fixture that "looks close enough" would pass while the
+    # real build silently went unpatched.
     (tmp_path / "setup_rocm.py").write_text(
         'sources = [\n'
         '    "csrc/elementwise/pos_enc.cu",\n'
         ']\n'
+        'default_target = "gfx942"\n'
+        'amdgpu_target = os.environ.get("AMDGPU_TARGET", default_target)\n'
+        '\n'
+        'if torch.cuda.is_available():\n'
+        '    try:\n'
+        '        amdgpu_target = torch.cuda.get_device_properties(0)'
+        '.gcnArchName.split(":")[0]\n'
+        '    except Exception as e:\n'
+        '        print(f"Warning: Failed to detect GPU properties: {e}")\n'
+        'else:\n'
+        '    print(f"Warning: torch.cuda not available. Using default '
+        'target: {amdgpu_target}")\n'
         'if amdgpu_target not in ["gfx942", "gfx950", "gfx1250"]:\n'
         '    sys.exit(1)\n'
         'topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" '
-        'else 32 * 1024 * 4\n'
+        'else 40 * 1024\n'
     )
     (tmp_path / "csrc" / "common_extension_rocm.cc").write_text(
         '  m.def("weak_ref_tensor(Tensor tensor) -> Tensor");\n'
@@ -55,6 +72,7 @@ def test_all_patches_apply_cleanly(aot):
     setup = (aot / "setup_rocm.py").read_text()
     assert "gfx1100" in setup
     assert "_LDS_64KB_ARCHS" in setup
+    assert "_target_from_env" in setup
     assert "gptq_kernel.cu" in setup
 
     ext = (aot / "csrc" / "common_extension_rocm.cc").read_text()
@@ -98,6 +116,49 @@ def test_missing_anchor_is_reported_not_silent(aot):
 def test_missing_file_is_reported(tmp_path):
     results = kp.apply(tmp_path, kp.BASE_PATCHES)
     assert any("MISSING" in r for r in results), results
+
+
+def test_explicit_target_beats_autodetection(aot):
+    """Cross-compiling must work, and must not cost you autodetection.
+
+    Asserting on the patched *text* is not enough here -- the bug this fixes
+    was a precedence bug, and precedence only shows up when the code runs. So
+    run the patched block against a fake torch that reports a different card.
+    """
+    kp.apply(aot, kp.BASE_PATCHES)
+    text = (aot / "setup_rocm.py").read_text()
+    block = text[text.index("default_target"):text.index("if amdgpu_target not in")]
+
+    class _Props:
+        gcnArchName = "gfx950:sramecc+:xnack-"
+
+    torch_with_mi355 = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_properties=lambda _index: _Props(),
+        )
+    )
+
+    # An MI355X is present and we asked for gfx1100 anyway. Before the patch
+    # this silently returned gfx950 and produced a kernel for the wrong card.
+    ns = {"os": types.SimpleNamespace(environ={"AMDGPU_TARGET": "gfx1100"}),
+          "torch": torch_with_mi355}
+    exec(block, ns)
+    assert ns["amdgpu_target"] == "gfx1100"
+
+    # Nothing requested: autodetection still wins, which is the right default
+    # for someone building for the card in front of them.
+    ns = {"os": types.SimpleNamespace(environ={}), "torch": torch_with_mi355}
+    exec(block, ns)
+    assert ns["amdgpu_target"] == "gfx950"
+
+    # No GPU at all (the CI builder): fall back to the declared default.
+    torch_headless = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(is_available=lambda: False)
+    )
+    ns = {"os": types.SimpleNamespace(environ={}), "torch": torch_headless}
+    exec(block, ns)
+    assert ns["amdgpu_target"] == "gfx942"
 
 
 def test_base_patches_alone_do_not_touch_gptq(aot):

@@ -27,10 +27,22 @@ RUN python3 -c "import torch, sys; sys.exit(0 if torch.version.hip else \
 # refs/heads. Upstream publishes release branches alongside tags, so
 # "v0.5.19" works as-is.
 #
-# `main` is the default and is what gets exercised. If it ever stops
-# importing, check the base image's torch version before pinning SGLang
-# backwards: an old torch presents as an SGLang bug and pinning SGLang back
-# to match it treats the symptom.
+# The two refs are not interchangeable, and neither is strictly better:
+#
+#   main      diffusion works (`import sglang.multimodal_gen` succeeds), but
+#             the AoT GPTQ kernel tree is gone -- upstream deleted it, so
+#             4-bit GPTQ models cannot run on the resulting image.
+#   v0.5.19   has the AoT GPTQ tree, but `import sglang.multimodal_gen`
+#             fails on `No module named 'aiter'` (aiter is CDNA-only), even
+#             with a GPU present. See docs/upstream-issues.md.
+#
+# main is the default because diffusion is the workload this image exists
+# for. Switch to v0.5.19 only if you need 4-bit GPTQ and not diffusion.
+#
+# One thing this ref is *not* for: working around import errors. If SGLang
+# stops importing, check the base image's torch version first -- an old
+# torch presents as an SGLang bug, and pinning SGLang back to match it
+# treats the symptom.
 ARG SGLANG_REF=main
 ARG AMDGPU_TARGETS=gfx1100
 LABEL org.opencontainers.image.source="https://github.com/AMD-AIM/sglang-radeon"
@@ -99,16 +111,24 @@ RUN pip install -q httpx \
       'dependency resolution replaced ROCm torch with %s' % torch.__version__)"
 
 # Build sgl-kernel for RDNA3. Upstream's build script exits on any target
-# outside gfx942/gfx950/gfx1250; the plugin patches that, gives RDNA3 the
-# 48 KB LDS budget it actually has, and compiles the GPTQ kernel that ROCm
-# otherwise never gets (which is what makes 4-bit 27B fit one 48 GB card).
+# outside gfx942/gfx950/gfx1250; the plugin patches that and gives RDNA3 the
+# same 48 KB LDS budget as gfx942. On sglang <= v0.5.19 it also compiles the
+# GPTQ kernel that ROCm otherwise never gets (what makes 4-bit 27B fit one
+# 48 GB card); newer sglang has no AoT GPTQ tree and build-kernel says so
+# and builds the rest.
+#
+# The braces are load-bearing. `a && b && c || true` binds as
+# `(a && b && c) || true`, so the trailing `|| true` -- meant only to excuse
+# an old pip without `cache purge` -- swallowed a failed kernel build, and
+# the image went on to the verification step below with no sgl_kernel in it.
+# That is how a build that "succeeded" in 1.2 seconds reported success.
 RUN sglang-rdna3 build-kernel \
       --sglang-src ${SGLANG_SRC} \
       --target ${AMDGPU_TARGETS} \
       --install \
  && rm -rf ${SGLANG_SRC}/python/sglang/kernels/aot/build \
            ${SGLANG_SRC}/python/sglang/kernels/aot/dist \
- && pip cache purge 2>/dev/null || true
+ && { pip cache purge 2>/dev/null || true; }
 
 # Fail the build rather than ship an image whose kernel is wrong. This runs
 # on a builder with no GPU, so it checks the artifact rather than the
@@ -118,11 +138,19 @@ RUN sglang-rdna3 build-kernel \
 #
 # Model-registration count is deliberately not asserted here -- it needs a
 # visible GPU. `sglang-rdna3 doctor` covers that on real hardware.
+#
+# The GPTQ assertion is conditional on the source tree, not unconditional.
+# Upstream removed the AoT GPTQ tree after v0.5.19, and build-kernel skips
+# those patches when it is absent; asserting the ops regardless would fail
+# the build on `main` for a feature `main` does not have. What must never be
+# silent is the other direction -- GPTQ sources present but ops missing
+# means the patches stopped applying -- so that case still fails hard.
 ARG AMDGPU_TARGETS
-RUN python3 - "$AMDGPU_TARGETS" <<'PY'
+RUN python3 - "$AMDGPU_TARGETS" "$SGLANG_SRC" <<'PY'
 import glob, os, re, subprocess, sys
 
 target = sys.argv[1] if len(sys.argv) > 1 else "gfx1100"
+sglang_src = sys.argv[2] if len(sys.argv) > 2 else "/opt/sglang-src"
 
 import sgl_kernel
 pkg = os.path.dirname(sgl_kernel.__file__)
@@ -130,11 +158,43 @@ sos = glob.glob(os.path.join(pkg, "common_ops*.so"))
 if not sos:
     sys.exit(f"no common_ops*.so in {pkg} -- the kernel did not install")
 
-out = subprocess.run(["strings", sos[0]], capture_output=True, text=True).stdout
-found = sorted(set(re.findall(r"gfx\d+", out)))
+# `strings` is not the real check -- a stray literal would satisfy it. Ask
+# the object what code it actually carries: every offload bundle entry must
+# be for the target, so a kernel built for the builder's own card (see the
+# env_target_precedence patch) fails here instead of shipping.
+#
+# Two traps here, both found the hard way:
+#
+#  - llvm-objdump ships inside the ROCm tree, not on PATH.
+#  - `--offloading` does not merely report on a HIP fat binary, it *extracts*
+#    each bundle into a sidecar file next to the input. Run it in place and
+#    site-packages/sgl_kernel fills up with common_ops.so.N.hipv4-... files,
+#    which sgl_kernel's own loader then globs and chokes on -- the check
+#    breaks the image it is checking. So inspect a copy in a temp dir.
+import shutil, tempfile
+objdump = (shutil.which("llvm-objdump")
+           or next((p for p in glob.glob("/opt/rocm*/llvm/bin/llvm-objdump")
+                    if os.access(p, os.X_OK)), None))
+found = []
+if objdump:
+    with tempfile.TemporaryDirectory() as tmp:
+        probe = os.path.join(tmp, os.path.basename(sos[0]))
+        shutil.copy2(sos[0], probe)
+        out = subprocess.run([objdump, "--offloading", probe],
+                             capture_output=True, text=True).stdout
+    found = sorted(set(re.findall(r"amdhsa--(gfx\d+)", out)))
+if not found:  # no llvm-objdump, or a build without offload bundles
+    out = subprocess.run(["strings", sos[0]], capture_output=True, text=True).stdout
+    found = sorted(set(re.findall(r"gfx\d+", out)))
 print("kernel targets:", ", ".join(found) or "(none)")
-if target not in found:
-    sys.exit(f"kernel was built for {found}, expected {target}")
+if found != [target]:
+    sys.exit(f"kernel carries code for {found}, expected exactly ['{target}']")
+
+gptq_src = os.path.join(sglang_src, "python", "sglang", "kernels", "aot",
+                        "csrc", "gemm", "gptq", "gptq_kernel.cu")
+if not os.path.exists(gptq_src):
+    print(f"sgl_kernel OK: built for {target} (no AoT GPTQ tree in this sglang)")
+    raise SystemExit(0)
 
 import torch
 missing = [op for op in ("gptq_shuffle", "gptq_gemm")

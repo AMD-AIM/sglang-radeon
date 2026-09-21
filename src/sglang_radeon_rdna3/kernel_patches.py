@@ -57,20 +57,26 @@ ARCH_GATE = Patch(
 
 # ---------------------------------------------------------------------------
 # 2. Shared-memory budget. RDNA3 has 64 KB of LDS per workgroup, the same as
-#    gfx942, so it needs the 48 KB budget -- not the 128 KB one upstream gives
-#    every non-gfx942 target. Patching only the allowlist yields a kernel
-#    configured for shared memory the hardware does not have.
+#    gfx942, so it belongs in gfx942's 48 KB bucket rather than the fallback.
+#
+#    The fallback used to be 32 * 1024 * 4 (128 KB), which RDNA3 does not
+#    have -- that is what this patch was originally written against. Upstream
+#    has since lowered it to 40 KB, so an unpatched build is no longer
+#    *unsafe* on RDNA3, merely conservative: 40 KB fits, it just leaves the
+#    8 KB that gfx942 is trusted with on the table. The anchor is updated
+#    rather than the patch dropped, so RDNA3 keeps parity with the
+#    architecture it shares an LDS size with.
 # ---------------------------------------------------------------------------
 SMEM_BUDGET = Patch(
     name="lds_budget",
     relpath="setup_rocm.py",
     old=('topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" '
-         "else 32 * 1024 * 4"),
+         "else 40 * 1024"),
     new=('_LDS_64KB_ARCHS = ("gfx942", "gfx1100", "gfx1101", "gfx1102")\n'
          "topk_dynamic_smem_bytes = (\n"
-         "    48 * 1024 if amdgpu_target in _LDS_64KB_ARCHS else 32 * 1024 * 4\n"
+         "    48 * 1024 if amdgpu_target in _LDS_64KB_ARCHS else 40 * 1024\n"
          ")"),
-    why="RDNA3 LDS is 64KB/workgroup; the 128KB budget is wrong for it",
+    why="RDNA3 shares gfx942's 64KB LDS and should share its 48KB budget",
     is_applied=_contains("_LDS_64KB_ARCHS"),
 )
 
@@ -148,8 +154,70 @@ GPTQ_HALF2_ADD = Patch(
     is_applied=_lacks("__ushort_as_half"),
 )
 
-BASE_PATCHES = (ARCH_GATE, SMEM_BUDGET)
+# ---------------------------------------------------------------------------
+# 7. Autodetection overrides the explicit target. Upstream reads
+#    AMDGPU_TARGET, then throws the answer away if any GPU is visible:
+#
+#        amdgpu_target = os.environ.get("AMDGPU_TARGET", default_target)
+#        if torch.cuda.is_available():
+#            amdgpu_target = torch.cuda.get_device_properties(0).gcnArchName...
+#
+#    So cross-compiling is impossible: ask for gfx1100 on a machine with an
+#    MI355X in it and you get a gfx950 kernel, with no warning and a zero exit
+#    status. The wheel installs, `import sgl_kernel` works, and the mismatch
+#    only surfaces as garbage or a crash on the target card.
+#
+#    CI never hits this -- a GPU-less builder takes the else branch and the
+#    env var survives -- which is exactly what makes it dangerous: it bites
+#    the developer building on their own workstation, not the pipeline.
+#
+#    Autodetection stays, as the default for someone building for the card
+#    they are sitting in front of. It just stops outranking an explicit
+#    request.
+# ---------------------------------------------------------------------------
+TARGET_PRECEDENCE = Patch(
+    name="env_target_precedence",
+    relpath="setup_rocm.py",
+    old=('amdgpu_target = os.environ.get("AMDGPU_TARGET", default_target)\n'
+         "\n"
+         "if torch.cuda.is_available():\n"
+         "    try:\n"
+         "        amdgpu_target = torch.cuda.get_device_properties(0)"
+         '.gcnArchName.split(":")[0]\n'
+         "    except Exception as e:\n"
+         '        print(f"Warning: Failed to detect GPU properties: {e}")\n'
+         "else:\n"
+         '    print(f"Warning: torch.cuda not available. Using default '
+         'target: {amdgpu_target}")'),
+    # Reordered rather than just guarded, so the message is true in all three
+    # cases. Guarding alone leaves the else branch announcing "torch.cuda not
+    # available" on a machine whose GPU is sitting right there and merely lost
+    # to an explicit request.
+    new=('amdgpu_target = os.environ.get("AMDGPU_TARGET", default_target)\n'
+         '_target_from_env = "AMDGPU_TARGET" in os.environ\n'
+         "\n"
+         "if _target_from_env:\n"
+         '    print(f"Building for AMDGPU_TARGET={amdgpu_target} '
+         '(set explicitly; autodetection skipped).")\n'
+         "elif torch.cuda.is_available():\n"
+         "    try:\n"
+         "        amdgpu_target = torch.cuda.get_device_properties(0)"
+         '.gcnArchName.split(":")[0]\n'
+         "    except Exception as e:\n"
+         '        print(f"Warning: Failed to detect GPU properties: {e}")\n'
+         "else:\n"
+         '    print(f"Warning: torch.cuda not available. Using default '
+         'target: {amdgpu_target}")'),
+    why="GPU autodetection silently overrides an explicit AMDGPU_TARGET",
+    is_applied=_contains("_target_from_env"),
+)
+
+BASE_PATCHES = (ARCH_GATE, SMEM_BUDGET, TARGET_PRECEDENCE)
 GPTQ_PATCHES = (GPTQ_SOURCE, GPTQ_REGISTER, GPTQ_HALF2_ZERO, GPTQ_HALF2_ADD)
+
+#: The file whose presence decides whether GPTQ can be built at all. Upstream
+#: dropped this tree after v0.5.19; see build_kernel.py for the fallback.
+GPTQ_KERNEL_SOURCE = "csrc/gemm/gptq/gptq_kernel.cu"
 
 
 def apply(aot_dir: Path, patches: Iterable[Patch], backup: bool = True) -> list[str]:

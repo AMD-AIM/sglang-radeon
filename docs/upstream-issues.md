@@ -70,6 +70,39 @@ use them.
 **Fix:** guard the import with try/except and degrade, rather than assuming
 every HIP device is CDNA with a matching aiter version.
 
+### Not installing aiter does not avoid it, and the surface is wide
+
+The obvious workaround — leave aiter out of a ROCm image that cannot use it —
+does not work, because these imports are unconditional under `if _is_hip:`.
+On `v0.5.19`, `import sglang.multimodal_gen` fails with
+`ModuleNotFoundError: No module named 'aiter'` **even with a GPU present**.
+
+Nor is it one import to stub. Feeding SGLang a synthetic `aiter` package and
+following the failures gives a chain, each hop only visible once the previous
+one is satisfied:
+
+1. `quark/schemes/quark_w4a4_mxfp4.py` — `aiter.ops.triton.gemm.fused...`
+2. `diffusers/utils/import_utils.py` — probes with
+   `importlib.util.find_spec("aiter")`, so a stub without a real
+   `__spec__` raises `ValueError: aiter.__spec__ is None`. A stub complete
+   enough to get past this also tells diffusers aiter *is* available, which
+   is worse than the original failure.
+3. `quark_int4fp8_moe.py:30` — `from aiter.ops.shuffle import shuffle_weight`
+
+…and it continues (`aiter.utility.fp4_utils`, `aiter.ops.triton.quant`,
+`aiter.ops.flydsl.moe_common`). Each stub moves the failure rather than
+fixing it.
+
+This package therefore does **not** ship an aiter shim. Faking a hardware
+acceleration library well enough to satisfy third-party capability probes is
+not a fix; it is a way to get CDNA code paths selected on a card that cannot
+run them. The real fix is the one above — make the imports lazy or guarded —
+and it has to happen upstream.
+
+`main` has since made the diffusion path tolerant (its `mxfp4.py` uses
+try/except), which is why this package defaults to `main` rather than
+`v0.5.19`.
+
 ---
 
 ## 4. `fused_add_rms_norm` is called with the wrong arity
@@ -290,3 +323,46 @@ with `HFValidationError: Repo id must be in the form 'repo_name' or
 'namespace/repo_name'` — an error that says nothing about the real problem.
 
 **Fix:** search recursively, or at least one extra level.
+
+---
+
+## 13. GPU autodetection silently overrides an explicit `AMDGPU_TARGET`
+
+`python/sglang/kernels/aot/setup_rocm.py:67`
+
+```python
+amdgpu_target = os.environ.get("AMDGPU_TARGET", default_target)
+
+if torch.cuda.is_available():
+    try:
+        amdgpu_target = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+```
+
+The environment variable is read and then thrown away whenever any GPU is
+visible, so **cross-compiling is impossible**. Asking for `gfx1100` on a
+machine with an MI355X in it produces a `gfx950` kernel — with no warning,
+a zero exit status, and a wheel that installs and imports cleanly. The
+mismatch only surfaces on the target card, far from its cause.
+
+It is easy to miss because CI never sees it: a GPU-less builder takes the
+`else` branch and the variable survives. It bites the developer building on
+their own workstation, which is also the person least likely to suspect the
+build script.
+
+Measured: `build-kernel --target gfx1100` on a gfx950 host, then
+
+```
+$ llvm-objdump --offloading common_ops.cpython-312-x86_64-linux-gnu.so
+hipv4-amdgcn-amd-amdhsa--gfx950      # every bundle, no gfx1100 anywhere
+```
+
+**Fix:** treat an explicit request as authoritative and autodetect only when
+none was made. Worth reordering rather than merely guarding, so the "torch.cuda
+not available" message does not get printed on a machine whose GPU is present
+and simply lost to an explicit request.
+
+> Note for anyone verifying this themselves: `llvm-objdump --offloading`
+> *extracts* the bundles into sidecar files next to its input rather than only
+> reporting on them. Run it on a copy — in place, it litters
+> `site-packages/sgl_kernel/` with files that sgl_kernel's own loader then
+> globs and fails on.

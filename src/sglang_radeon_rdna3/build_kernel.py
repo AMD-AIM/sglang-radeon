@@ -80,7 +80,23 @@ def main(argv: list[str] | None = None) -> int:
 
     aot = find_aot_dir(args.sglang_src)
     patches = kernel_patches.BASE_PATCHES
-    if not args.no_gptq:
+    gptq = not args.no_gptq
+
+    # Upstream deleted the AoT GPTQ tree after v0.5.19 (it survives only on
+    # the JIT Marlin path). Without this check the GPTQ patches still half
+    # apply -- gptq_source happily adds csrc/gemm/gptq/gptq_kernel.cu to the
+    # build's source list, and the compile then fails on a file that is not
+    # there. Absent sources are a version difference, not a broken checkout,
+    # so say so and carry on with base RDNA3 support.
+    if gptq and not (aot / kernel_patches.GPTQ_KERNEL_SOURCE).exists():
+        print(f"note: {kernel_patches.GPTQ_KERNEL_SOURCE} is not in this "
+              "sglang; upstream removed the AoT GPTQ tree after v0.5.19.\n"
+              "      Building base RDNA3 support without GPTQ. 4-bit GPTQ "
+              "models will not run on the resulting image --\n"
+              "      build with SGLANG_REF=v0.5.19 if you need them.")
+        gptq = False
+
+    if gptq:
         patches = patches + kernel_patches.GPTQ_PATCHES
 
     print(f"[1/3] build dir: {aot}")
