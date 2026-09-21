@@ -7,10 +7,15 @@
 # Built on AMD's ROCm PyTorch image, so the hardest prerequisite -- a ROCm
 # build of PyTorch that nothing has quietly replaced with a CUDA one -- is
 # already satisfied.
-# Any ROCm PyTorch base works. This one is what the project was validated
-# against end to end (ROCm 7.2.1, PyTorch 2.9.1, Python 3.12); newer tags in
-# the same family should be fine, but have not been exercised here.
-ARG ROCM_PYTORCH_IMAGE=rocm/pytorch:rocm7.0_ubuntu24.04_py3.12_pytorch_release_2.6.0
+#
+# The tag matters more than it looks. SGLang reaches into private CUDA
+# allocator APIs (_cuda_beginAllocateCurrentThreadToPool and friends) that
+# landed in torch 2.8, so anything older cannot import SGLang at all -- and
+# the symptom is a KeyError deep in an unrelated import, not a clear message
+# about torch. This is the tag README.md reports as validated (ROCm 7.2.1,
+# PyTorch 2.9.1, Python 3.12, HIP 7.2.53211); newer tags in the same family
+# work too, older ones do not. Do not lower it to "match" an older SGLang.
+ARG ROCM_PYTORCH_IMAGE=rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.9.1
 FROM ${ROCM_PYTORCH_IMAGE}
 
 # Guard against the one mistake that silently ruins everything downstream:
@@ -22,12 +27,10 @@ RUN python3 -c "import torch, sys; sys.exit(0 if torch.version.hip else \
 # refs/heads. Upstream publishes release branches alongside tags, so
 # "v0.5.19" works as-is.
 #
-# Mind the pairing with the base image's PyTorch. SGLang main currently
-# wants torch.cuda.memory._cuda_beginAllocateCurrentThreadToPool, which the
-# pinned ROCm torch 2.6.0 does not have, so `main` + the default base fails
-# the import check at the end of this file. v0.5.19 is contemporaneous with
-# torch 2.6 and is what has been run in production on ROCm 7.0. Bump both
-# together, or not at all.
+# `main` is the default and is what gets exercised. If it ever stops
+# importing, check the base image's torch version before pinning SGLang
+# backwards: an old torch presents as an SGLang bug and pinning SGLang back
+# to match it treats the symptom.
 ARG SGLANG_REF=main
 ARG AMDGPU_TARGETS=gfx1100
 LABEL org.opencontainers.image.source="https://github.com/AMD-AIM/sglang-radeon"
@@ -54,57 +57,46 @@ RUN mkdir -p ${SGLANG_SRC} \
 
 COPY . /opt/sglang-radeon
 
-# Everything SGLang-related with --no-deps, plus the ordinary transitive
-# dependencies that --no-deps skips and nothing else pulls in.
+# Everything SGLang-related with --no-deps, then close the transitive gap
+# that --no-deps leaves behind.
 #
-# --no-deps because SGLang's dependency list hard-codes CUDA
-# packages with no platform markers (cuda-python, flashinfer[cu13],
-# nvidia-cutlass-dsl, and sglang-kernel, whose PyPI wheel is CUDA-only and
-# would shadow the kernel we build below). Letting pip resolve them installs
-# a CUDA build of PyTorch over the ROCm one in the base image.
+# --no-deps because SGLang's dependency list hard-codes CUDA packages with
+# no platform markers (cuda-python, flashinfer[cu13], nvidia-cutlass-dsl,
+# and sglang-kernel, whose PyPI wheel is CUDA-only and would shadow the
+# kernel we build below). It is not merely preferable here, it is the only
+# option: the set is unresolvable against a ROCm base by construction --
+# compressed-tensors pins torch>=2.10.0 and SGLang itself pins torch==2.13.0,
+# so a full resolve ends in ResolutionImpossible, and the only way to make
+# it resolvable is to let pip install the CUDA torch it is asking for.
 #
 # The catch is that --no-deps makes the transitive set our problem, and
-# hand-listing it does not scale: the published image built from the old
-# list could not run `sglang serve` at all -- starlette, traitlets,
-# multidict, attrs, yarl and friends were all missing, and pydantic-core
-# was absent so pydantic imported against nothing.
+# hand-listing it does not scale. The list that used to live here drifted
+# until the published image could not run `sglang serve` at all -- starlette,
+# traitlets, multidict, attrs, yarl and pydantic-core were all missing --
+# and adding names one at a time only moves the failure: repair the venv
+# enough to import transformers and the next build dies on `regex`.
 #
-# So the second list below deliberately names *front-door* packages and
-# lets pip resolve their trees normally. None of them depends on torch, so
-# the ROCm build in the base image is not at risk -- verified: torch stays
-# at 2.6.0+rocm7 afterwards. Keeping this list short and resolvable beats
-# enumerating two dozen leaf packages that drift with every SGLang bump.
-RUN pip install --no-deps --no-build-isolation -q -e ${SGLANG_SRC}/python \
+# So close_deps.py computes the closure from the installed distributions'
+# own metadata instead of guessing it. See its docstring for why a clean
+# `pip check` is deliberately *not* the goal.
+#
+# httpx goes in first, before anything else: this base ships `kernels` +
+# `huggingface_hub`, whose import chain needs httpx, and SGLang's build hook
+# imports them while generating its metadata. Install it afterwards and the
+# editable install above never gets far enough to need it.
+RUN pip install -q httpx \
+ && pip install --no-deps --no-build-isolation -q -e ${SGLANG_SRC}/python \
  && python3 /opt/sglang-radeon/scripts/filter_deps.py \
       --pyproject ${SGLANG_SRC}/python/pyproject.toml \
       --output /tmp/deps.txt --diffusion --show-dropped \
  && pip install --no-deps --no-build-isolation -q -r /tmp/deps.txt \
  && pip install --no-deps -q "huggingface_hub>=1.0,<2.0" apache-tvm-ffi==0.1.11 \
       kernels_data hf_transfer hf_xet \
- && pip install -q httpx urllib3 certifi idna sniffio anyio h11 httpcore \
- && pip install -q fastapi pydantic aiohttp ipython charset_normalizer \
  && pip install --no-deps -q /opt/sglang-radeon \
+ && python3 /opt/sglang-radeon/scripts/close_deps.py \
  && rm -f /tmp/deps.txt \
  && python3 -c "import torch, sys; sys.exit(0 if torch.version.hip else \
       'dependency resolution replaced ROCm torch with %s' % torch.__version__)"
-
-# Swap setuptools' editable finder for a plain .pth.
-#
-# `pip install -e` generates __editable___sglang_*_finder.py with a
-# NAMESPACES table of every subpackage it discovered. On SGLang that table
-# comes out incomplete: it lists dozens of sglang.multimodal_gen.* entries
-# but not sglang.multimodal_gen itself, so importing anything underneath
-# dies with KeyError: 'sglang.multimodal_gen'. That is the whole diffusion
-# stack -- `sglang serve --model-type diffusion` could not start, while the
-# LLM path looked fine, which is why it went unnoticed.
-#
-# The sources are already on disk at a fixed path, so a one-line .pth does
-# the same job with none of the discovery logic. The dist-info stays, so
-# `pip show sglang` and friends keep working.
-RUN SP=$(python3 -c "import site; print(site.getsitepackages()[0])") \
- && rm -f "$SP"/__editable__.sglang-*.pth "$SP"/__editable___sglang_*_finder.py \
- && echo "${SGLANG_SRC}/python" > "$SP/sglang-src.pth" \
- && python3 -c "import sglang.multimodal_gen as m; print('multimodal_gen:', m.__file__)"
 
 # Build sgl-kernel for RDNA3. Upstream's build script exits on any target
 # outside gfx942/gfx950/gfx1250; the plugin patches that, gives RDNA3 the
@@ -160,14 +152,22 @@ PY
 # CLI flag present in the source, and a venv too incomplete to import any
 # of it. The failure only showed up at `docker run`, as CrashLoopBackOff.
 #
-# Both backends are exercised, because they fail independently: the LLM
-# path came back first while diffusion was still dead on
-# KeyError: 'sglang.multimodal_gen'.
+# multimodal_gen is named separately from sglang because it is the diffusion
+# stack's entry point and it pulls in a different slice of the dependency
+# tree; an incomplete venv has shown up here while plain `import sglang`
+# still worked.
 #
-# --help only. No GPU on the builder, and no weights to point at.
-RUN sglang serve --help > /dev/null \
- && sglang serve --model-type diffusion --help > /dev/null \
- && echo "sglang OK: LLM and diffusion backends both import and parse args"
+# `sglang serve --help` is deliberately NOT here, tempting as it is. It
+# reaches hardware while merely printing help (the diffusion path calls
+# torch.cuda.get_device_properties(0) to decide what to print), so on a
+# GPU-less builder it dies with "No HIP GPUs are available" no matter how
+# healthy the image is. `sglang-rdna3 doctor` covers it on real hardware,
+# which is where it belongs.
+RUN python3 -c "import sglang" \
+ && python3 -c "import sglang.multimodal_gen" \
+ && python3 -c "import sglang.cli.main" \
+ && sglang --help > /dev/null \
+ && echo "sglang OK: LLM and diffusion stacks both import, CLI parses args"
 
 WORKDIR /workspace
 VOLUME ["/workspace", "/models"]

@@ -43,6 +43,19 @@ EXCLUDE = {
     "nvidia-mathdx",
     "nvidia-ml-py",
     "nvidia-modelopt",
+    # Reached only transitively, through packages that themselves survive
+    # the filter -- so they slip in unless named here. Together they are
+    # 548 MB of CUDA payload in a ROCm image: tokenspeed is CUDA
+    # speculative decoding, nvshmem is multi-node CUDA collectives, and the
+    # cuda-* pair are CUDA driver bindings. Verified that `import sglang`,
+    # `import sglang.multimodal_gen`, `import sglang.cli.main` and
+    # `sglang --help` all still pass with all six absent.
+    "tokenspeed-mla",
+    "tokenspeed-triton",
+    "nvidia-nvshmem-cu13",
+    "nvidia-cuda-cccl",
+    "cuda-core",
+    "cuda-pathfinder",
     # CUDA-only wheel that shadows the locally built gfx1100 kernel
     "sglang-kernel",
     # Provided by the ROCm install; never let pip re-resolve these
@@ -70,8 +83,15 @@ _CUDA_EXTRA = re.compile(r"\[cu\d+\]")
 
 
 def requirement_name(spec: str) -> str:
-    """Package name from a requirement string, normalised for comparison."""
-    return re.split(r"[\[<>=!;\s]", spec.strip(), maxsplit=1)[0].lower().replace("_", "-")
+    """Package name from a requirement string, normalised for comparison.
+
+    Normalisation follows PEP 503: any run of ``-``, ``_`` or ``.`` becomes a
+    single ``-``. The dot matters -- SGLang asks for ``cuda.core`` and
+    ``cuda.pathfinder`` while the projects are named ``cuda-core`` and
+    ``cuda-pathfinder``, so matching on the raw string misses them.
+    """
+    bare = re.split(r"[\[<>=!;\s]", spec.strip(), maxsplit=1)[0]
+    return re.sub(r"[-_.]+", "-", bare).lower()
 
 
 def filter_requirements(specs, exclude) -> list[str]:
