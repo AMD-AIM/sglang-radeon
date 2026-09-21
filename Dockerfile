@@ -18,6 +18,16 @@ FROM ${ROCM_PYTORCH_IMAGE}
 RUN python3 -c "import torch, sys; sys.exit(0 if torch.version.hip else \
       'base image has a CUDA PyTorch (%s); use a ROCm one' % torch.__version__)"
 
+# SGLANG_REF must be a *branch* name -- the tarball below is fetched from
+# refs/heads. Upstream publishes release branches alongside tags, so
+# "v0.5.19" works as-is.
+#
+# Mind the pairing with the base image's PyTorch. SGLang main currently
+# wants torch.cuda.memory._cuda_beginAllocateCurrentThreadToPool, which the
+# pinned ROCm torch 2.6.0 does not have, so `main` + the default base fails
+# the import check at the end of this file. v0.5.19 is contemporaneous with
+# torch 2.6 and is what has been run in production on ROCm 7.0. Bump both
+# together, or not at all.
 ARG SGLANG_REF=main
 ARG AMDGPU_TARGETS=gfx1100
 LABEL org.opencontainers.image.source="https://github.com/AMD-AIM/sglang-radeon"
@@ -44,15 +54,26 @@ RUN mkdir -p ${SGLANG_SRC} \
 
 COPY . /opt/sglang-radeon
 
-# Everything SGLang-related with --no-deps, plus a handful of ordinary
-# transitive dependencies (httpx and friends) that --no-deps skips and
-# nothing else pulls in.
+# Everything SGLang-related with --no-deps, plus the ordinary transitive
+# dependencies that --no-deps skips and nothing else pulls in.
 #
 # --no-deps because SGLang's dependency list hard-codes CUDA
 # packages with no platform markers (cuda-python, flashinfer[cu13],
 # nvidia-cutlass-dsl, and sglang-kernel, whose PyPI wheel is CUDA-only and
 # would shadow the kernel we build below). Letting pip resolve them installs
 # a CUDA build of PyTorch over the ROCm one in the base image.
+#
+# The catch is that --no-deps makes the transitive set our problem, and
+# hand-listing it does not scale: the published image built from the old
+# list could not run `sglang serve` at all -- starlette, traitlets,
+# multidict, attrs, yarl and friends were all missing, and pydantic-core
+# was absent so pydantic imported against nothing.
+#
+# So the second list below deliberately names *front-door* packages and
+# lets pip resolve their trees normally. None of them depends on torch, so
+# the ROCm build in the base image is not at risk -- verified: torch stays
+# at 2.6.0+rocm7 afterwards. Keeping this list short and resolvable beats
+# enumerating two dozen leaf packages that drift with every SGLang bump.
 RUN pip install --no-deps --no-build-isolation -q -e ${SGLANG_SRC}/python \
  && python3 /opt/sglang-radeon/scripts/filter_deps.py \
       --pyproject ${SGLANG_SRC}/python/pyproject.toml \
@@ -61,8 +82,29 @@ RUN pip install --no-deps --no-build-isolation -q -e ${SGLANG_SRC}/python \
  && pip install --no-deps -q "huggingface_hub>=1.0,<2.0" apache-tvm-ffi==0.1.11 \
       kernels_data hf_transfer hf_xet \
  && pip install -q httpx urllib3 certifi idna sniffio anyio h11 httpcore \
+ && pip install -q fastapi pydantic aiohttp ipython charset_normalizer \
  && pip install --no-deps -q /opt/sglang-radeon \
- && rm -f /tmp/deps.txt
+ && rm -f /tmp/deps.txt \
+ && python3 -c "import torch, sys; sys.exit(0 if torch.version.hip else \
+      'dependency resolution replaced ROCm torch with %s' % torch.__version__)"
+
+# Swap setuptools' editable finder for a plain .pth.
+#
+# `pip install -e` generates __editable___sglang_*_finder.py with a
+# NAMESPACES table of every subpackage it discovered. On SGLang that table
+# comes out incomplete: it lists dozens of sglang.multimodal_gen.* entries
+# but not sglang.multimodal_gen itself, so importing anything underneath
+# dies with KeyError: 'sglang.multimodal_gen'. That is the whole diffusion
+# stack -- `sglang serve --model-type diffusion` could not start, while the
+# LLM path looked fine, which is why it went unnoticed.
+#
+# The sources are already on disk at a fixed path, so a one-line .pth does
+# the same job with none of the discovery logic. The dist-info stays, so
+# `pip show sglang` and friends keep working.
+RUN SP=$(python3 -c "import site; print(site.getsitepackages()[0])") \
+ && rm -f "$SP"/__editable__.sglang-*.pth "$SP"/__editable___sglang_*_finder.py \
+ && echo "${SGLANG_SRC}/python" > "$SP/sglang-src.pth" \
+ && python3 -c "import sglang.multimodal_gen as m; print('multimodal_gen:', m.__file__)"
 
 # Build sgl-kernel for RDNA3. Upstream's build script exits on any target
 # outside gfx942/gfx950/gfx1250; the plugin patches that, gives RDNA3 the
@@ -109,6 +151,23 @@ if missing:
     sys.exit(f"{', '.join(missing)} not registered -- the GPTQ patches did not take")
 print("sgl_kernel OK: built for", target, "with GPTQ ops")
 PY
+
+# Fail the build rather than ship an image that cannot start SGLang.
+#
+# The check above proves the *kernel* is right. Nothing proved that
+# `sglang` imports -- and that is exactly how the previously published
+# image shipped: correct gfx1100 kernel, complete MiniMax-H3 configs, every
+# CLI flag present in the source, and a venv too incomplete to import any
+# of it. The failure only showed up at `docker run`, as CrashLoopBackOff.
+#
+# Both backends are exercised, because they fail independently: the LLM
+# path came back first while diffusion was still dead on
+# KeyError: 'sglang.multimodal_gen'.
+#
+# --help only. No GPU on the builder, and no weights to point at.
+RUN sglang serve --help > /dev/null \
+ && sglang serve --model-type diffusion --help > /dev/null \
+ && echo "sglang OK: LLM and diffusion backends both import and parse args"
 
 WORKDIR /workspace
 VOLUME ["/workspace", "/models"]
