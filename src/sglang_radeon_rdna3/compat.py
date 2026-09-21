@@ -446,6 +446,11 @@ def _patch_ptx_primitives() -> str:
         if getattr(mod, "_rdna3_ptx_patched", False):
             applied.append(f"{mod_path.rsplit('.', 1)[-1]}(cached)")
             continue
+
+        # Capture the originals before overwriting them: they are what
+        # identifies a module that did `from numerics import mul_rn_f32`.
+        originals = {name: getattr(mod, name, None) for name in subs}
+
         for name, impl in subs.items():
             if hasattr(mod, name):
                 setattr(mod, name, impl)
@@ -453,11 +458,31 @@ def _patch_ptx_primitives() -> str:
         mod._rdna3_ptx_patched = True
 
         # Rebind copies imported by name into other modules.
+        #
+        # Two things here are deliberate and must not be "simplified" back:
+        #
+        # 1. Read from __dict__ rather than getattr(). sys.modules holds
+        #    objects with a dynamic __getattr__, and torch.ops is one of
+        #    them: asking it for any unknown name *fabricates an operator
+        #    namespace* and records it. Probing for "mul_rn_f32" therefore
+        #    invented torch.ops.mul_rn_f32, the setattr below replaced it
+        #    with a Triton function, and torch later walked its own
+        #    namespace list and died with
+        #        TypeError: attribute name must be string, not 'function'
+        #    deep inside inductor's decomposition table -- which surfaced
+        #    as `sglang serve` refusing to start at all.
+        # 2. Match on identity, not on the name. A module that merely
+        #    happens to define something called "_rcp4" is not our copy,
+        #    and overwriting it would be a silent corruption of unrelated
+        #    code.
         for other in list(sys.modules.values()):
             if other is None or other is mod:
                 continue
+            namespace = getattr(other, "__dict__", None)
+            if not isinstance(namespace, dict):
+                continue
             for name, impl in subs.items():
-                if getattr(other, name, None) is not None and hasattr(mod, name):
+                if originals[name] is not None and namespace.get(name) is originals[name]:
                     setattr(other, name, impl)
 
     # Triton caches compiled kernels keyed on their callees' source.
