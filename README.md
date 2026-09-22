@@ -108,13 +108,19 @@ python -m sglang.launch_server \
 
   [ok  ] sgl_kernel importable
   [ok  ] sglang detects ROCm/HIP
+  [ok  ] serve import chain complete (quantization + cli.serve)
+  [ok  ] diffusion platform is RocmPlatform
   [ok  ] 22 backends, triton available
   [ok  ] 249 model architectures registered
 
   compat shims:
-    - aiter_gemm_stubs: applied (3 stub modules)
+    - aiter_gemm_stubs: applied (aiter absent; whole-package placeholder
+                        installed; apex RoPE pinned to its native kernel)
     - fused_add_rms_norm_arity: applied
 ```
+
+`doctor` exits non-zero when any line reads `[FAIL]`, so it is safe to put in
+a script or a container healthcheck.
 
 "249 model architectures registered" is the number that matters. If you see a
 number under ten, `sgl_kernel` is missing or is a CUDA build, and almost

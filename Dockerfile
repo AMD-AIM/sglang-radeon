@@ -96,6 +96,14 @@ COPY . /opt/sglang-radeon
 # `huggingface_hub`, whose import chain needs httpx, and SGLang's build hook
 # imports them while generating its metadata. Install it afterwards and the
 # editable install above never gets far enough to need it.
+# amdsmi is not optional, despite installing like it is. SGLang-Diffusion
+# picks its platform by probing for GPUs *through amdsmi*
+# (multimodal_gen/runtime/platforms/__init__.py::rocm_platform_plugin), and
+# falls back to CpuPlatform when the import fails. The result is a diffusion
+# runtime that quietly believes it is on a CPU while sitting on a working
+# W7900D: it reports host RAM as available memory, and MiniMax-H3's denoise
+# loop refuses to run because its gate wants CUDA or MPS. ROCm ships the
+# bindings, they are just not on the venv's path -- so put them there.
 RUN pip install -q httpx \
  && pip install --no-deps --no-build-isolation -q -e ${SGLANG_SRC}/python \
  && python3 /opt/sglang-radeon/scripts/filter_deps.py \
@@ -105,6 +113,7 @@ RUN pip install -q httpx \
  && pip install --no-deps -q "huggingface_hub>=1.0,<2.0" apache-tvm-ffi==0.1.11 \
       kernels_data hf_transfer hf_xet \
  && pip install --no-deps -q /opt/sglang-radeon \
+ && pip install --no-deps -q /opt/rocm/share/amd_smi \
  && python3 /opt/sglang-radeon/scripts/close_deps.py \
  && rm -f /tmp/deps.txt \
  && python3 -c "import torch, sys; sys.exit(0 if torch.version.hip else \
@@ -228,6 +237,58 @@ RUN python3 -c "import sglang" \
  && python3 -c "import sglang.cli.main" \
  && sglang --help > /dev/null \
  && echo "sglang OK: LLM and diffusion stacks both import, CLI parses args"
+
+# The serve chain stays untestable here, but the thing that broke it does not.
+#
+# sglang's HIP branches import aiter unconditionally, at module scope, with no
+# regard for SGLANG_USE_AITER. This image has no aiter and never will -- aiter
+# is CDNA-only -- so what keeps `sglang serve` alive is the compat shim that
+# fabricates the namespace. When that shim stopped covering "aiter is absent
+# entirely" (it only handled "aiter present, wrong layout"), every check above
+# stayed green and the image shipped; the failure surfaced as
+#     quark_w4a4_mxfp4.py:86  ModuleNotFoundError: No module named 'aiter'
+# the first time anyone ran `sglang serve`.
+#
+# None of this needs a GPU to verify, so verify it.
+RUN python3 - <<'PY'
+import sglang  # fires the .pth bootstrap, which applies the compat shims
+from sglang_radeon_rdna3 import compat
+
+status = compat.STATUS.get("aiter_gemm_stubs", "<shim never ran>")
+print("aiter shim:", status)
+if status.startswith(("skipped", "FAILED", "<")):
+    raise SystemExit(f"the aiter compat shim did not fire: {status}")
+
+# Must import no matter which mode the shim chose.
+import aiter
+from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (  # noqa: F401
+    fused_gemm_afp4wfp4_split_cat,
+)
+
+if getattr(aiter, "_rdna3_placeholder", False):
+    # Placeholders must be inert on import and loud on call -- a silent
+    # no-op would corrupt results instead of stopping.
+    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+    try:
+        dynamic_mxfp4_quant()
+    except RuntimeError:
+        pass
+    else:
+        raise SystemExit("the aiter placeholder ran instead of refusing to")
+    import os
+    if os.environ.get("USE_ROCM_AITER_ROPE_BACKEND") != "0":
+        raise SystemExit(
+            "aiter is a placeholder but apex's RoPE backend was not pinned "
+            "away from it; RoPE would fail mid-forward-pass"
+        )
+print("aiter OK: imports resolve, kernels refuse to run, apex unfooled")
+
+# Whether amdsmi *finds* a GPU needs a GPU; whether it is importable does
+# not, and an unimportable amdsmi is what silently demotes the diffusion
+# runtime to CpuPlatform. `sglang-rdna3 doctor` checks the rest on hardware.
+import amdsmi  # noqa: F401,E402
+print("amdsmi OK: importable, so diffusion can detect ROCm at runtime")
+PY
 
 WORKDIR /workspace
 VOLUME ["/workspace", "/models"]

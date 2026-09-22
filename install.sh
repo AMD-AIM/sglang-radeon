@@ -320,6 +320,21 @@ pip install --no-deps --no-build-isolation -q -r "$WORKDIR/deps.txt"
 # --no-deps skips second-order requirements; these are needed and are not
 # CUDA-specific.
 pip install --no-deps -q "huggingface_hub>=1.0,<2.0" apache-tvm-ffi==0.1.11 kernels_data
+
+# SGLang-Diffusion detects ROCm by probing through amdsmi, and falls back to
+# CpuPlatform when that import fails -- a diffusion runtime that believes it
+# is on a CPU while sitting on a working GPU. ROCm ships the bindings; they
+# are just not on the venv's path. Absent on an LLM-only install, which is
+# why this is not fatal.
+for smi in /opt/rocm/share/amd_smi /opt/rocm*/share/amd_smi; do
+  if [ -d "$smi" ] && pip install --no-deps -q "$smi" 2>/dev/null; then
+    ok "amdsmi (from $smi)"
+    break
+  fi
+done
+python3 -c 'import amdsmi' 2>/dev/null \
+  || warn "amdsmi not installed — SGLang-Diffusion will report CpuPlatform"
+
 ok "dependencies installed"
 
 # Verify nothing swapped torch out from under us.

@@ -12,11 +12,108 @@ import pytest
 from sglang_radeon_rdna3 import compat
 
 
-def test_aiter_stub_is_skipped_when_aiter_absent(monkeypatch):
+@pytest.fixture
+def absent_aiter(monkeypatch):
+    """Run the shim in its "aiter is not installed at all" mode.
+
+    Yields the status string. Teardown matters here: the shim installs a
+    sys.meta_path finder, which is process-global, so leaving it behind would
+    hand every later test a fabricated `aiter`.
+    """
+    for name in [n for n in sys.modules if n == "aiter" or n.startswith("aiter.")]:
+        monkeypatch.delitem(sys.modules, name)
+    # The shim sets this once and leaves it; clear it so each test sees a
+    # first run rather than the previous test's leftovers.
+    monkeypatch.delenv("USE_ROCM_AITER_ROPE_BACKEND", raising=False)
+    # A None entry is what an absent module looks like to `import`.
     monkeypatch.setitem(sys.modules, "aiter", None)
-    # A None entry makes `import aiter` raise, mimicking "not installed".
-    result = compat._stub_aiter_gemm_submodules()
-    assert "skipped" in result or "applied" in result
+    status = compat._stub_aiter_gemm_submodules()
+    monkeypatch.delitem(sys.modules, "aiter")  # the finder answers from here on
+    try:
+        yield status
+    finally:
+        sys.meta_path[:] = [
+            f for f in sys.meta_path
+            if not isinstance(f, compat._AiterPlaceholderFinder)
+        ]
+        for name in [n for n in list(sys.modules)
+                     if n == "aiter" or n.startswith("aiter.")]:
+            if getattr(sys.modules[name], "_rdna3_placeholder", False):
+                del sys.modules[name]
+
+
+def test_absent_aiter_gets_a_whole_package_placeholder(absent_aiter):
+    """The regression that shipped a green image: aiter missing entirely.
+
+    The older shim returned "skipped (aiter not installed)" here and left
+    sglang to die at import. Anything but a placeholder is that bug again.
+    """
+    assert absent_aiter.startswith("applied"), absent_aiter
+
+    import aiter
+
+    assert aiter._rdna3_placeholder is True
+
+    # Arbitrary depth, because the set of modules sglang reaches for moves
+    # with every upstream bump -- enumerating them is what failed before.
+    from aiter.ops.triton.quant import dynamic_mxfp4_quant  # noqa: F401
+    from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (  # noqa: F401,E501
+        fused_gemm_afp4wfp4_split_cat,
+    )
+    import aiter.some.module.nobody.has.written.yet  # noqa: F401
+
+
+def test_placeholder_refuses_to_run(absent_aiter):
+    """Inert on import, loud on call. A silent no-op would corrupt output."""
+    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+    with pytest.raises(RuntimeError, match="CDNA-only"):
+        dynamic_mxfp4_quant()
+    # The message has to name the attribute, or a mid-pass failure says
+    # nothing about which kernel was reached.
+    with pytest.raises(RuntimeError, match=r"aiter\.ops\.triton\.quant"):
+        dynamic_mxfp4_quant()
+
+
+def test_placeholder_leaves_dunders_to_python(absent_aiter):
+    """importlib, inspect and pickle probe for dunders and expect to fail."""
+    import aiter
+
+    with pytest.raises(AttributeError):
+        aiter.__wrapped__
+
+
+def test_placeholder_disarms_apex_rope_probe(absent_aiter, monkeypatch):
+    """apex picks its RoPE kernel by `try: import aiter`.
+
+    A placeholder that satisfies that probe moves the failure from import time
+    into the middle of a forward pass, which is worse than the crash we set
+    out to fix.
+    """
+    import os
+
+    assert os.environ["USE_ROCM_AITER_ROPE_BACKEND"] == "0"
+    assert "apex RoPE" in absent_aiter
+
+
+def test_placeholder_does_not_override_an_explicit_rope_choice(monkeypatch):
+    """Someone who set the var has a reason; the shim is not the authority."""
+    monkeypatch.setenv("USE_ROCM_AITER_ROPE_BACKEND", "1")
+    assert compat._disarm_aiter_presence_probes() == ""
+    import os
+
+    assert os.environ["USE_ROCM_AITER_ROPE_BACKEND"] == "1"
+
+
+def test_placeholder_install_is_idempotent(absent_aiter):
+    before = sum(
+        isinstance(f, compat._AiterPlaceholderFinder) for f in sys.meta_path
+    )
+    assert compat._install_aiter_placeholder().startswith("already applied")
+    after = sum(
+        isinstance(f, compat._AiterPlaceholderFinder) for f in sys.meta_path
+    )
+    assert before == after == 1
 
 
 def test_aiter_stub_creates_importable_modules(monkeypatch):
@@ -102,6 +199,45 @@ def test_apply_all_never_raises(monkeypatch):
     def boom():
         raise ValueError("simulated failure")
 
-    monkeypatch.setattr(compat, "_SHIMS", (("exploding", boom),))
+    monkeypatch.setattr(compat, "_SHIMS", (("exploding", boom, False),))
     status = compat.apply_all()
     assert status["exploding"].startswith("FAILED")
+
+
+def test_deferrable_shim_reports_deferred_not_skipped(monkeypatch):
+    """A shim whose target is not importable *yet* must say so.
+
+    Reporting "skipped" is indistinguishable from "not applicable", which is
+    how nested_weight_detection went a whole release never applying while
+    doctor -- run later, with everything imported -- called it healthy.
+    """
+    monkeypatch.setattr(
+        compat, "STATUS", {}, raising=False
+    )
+    monkeypatch.setattr(
+        compat,
+        "_SHIMS",
+        (
+            ("waits", lambda: "skipped (sglang-diffusion not available)", True),
+            ("final", lambda: "skipped (vllm not installed)", False),
+        ),
+    )
+    status = compat.apply_all()
+    assert status["waits"] == "deferred (sglang-diffusion not available)"
+    assert status["final"] == "skipped (vllm not installed)"
+    assert compat.deferred_shims() == ["waits"]
+
+
+def test_apply_all_does_not_rerun_applied_shims(monkeypatch):
+    """Some shims walk whole package trees; the bootstrap may retry often."""
+    calls = []
+    monkeypatch.setattr(compat, "STATUS", {}, raising=False)
+    monkeypatch.setattr(
+        compat,
+        "_SHIMS",
+        (("counts", lambda: calls.append(1) or "applied (1 thing)", True),),
+    )
+    compat.apply_all()
+    compat.apply_all()
+    assert len(calls) == 1
+    assert compat.deferred_shims() == []

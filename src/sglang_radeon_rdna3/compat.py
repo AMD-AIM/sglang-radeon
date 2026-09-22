@@ -11,6 +11,8 @@ from __future__ import annotations
 import logging
 import sys
 import types
+from importlib.abc import Loader, MetaPathFinder
+from importlib.machinery import ModuleSpec
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -20,18 +22,38 @@ STATUS: dict[str, str] = {}
 
 
 # ---------------------------------------------------------------------------
-# Shim 1 -- stub CDNA-only aiter GEMM submodules.
+# Shim 1 -- stand in for the CDNA-only aiter kernels.
 #
 # sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4.py does:
 #     if _is_hip:
 #         from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import ...
-# Released aiter builds place those kernels directly under aiter/ops/triton/
-# with no gemm/fused subpackage, so the import raises ModuleNotFoundError.
 # That happens inside layers/quantization/__init__.py, which sits on the import
 # path of *every* model module -- so `import sglang` registers almost nothing.
 #
-# These are MXFP4 GEMMs for CDNA. RDNA3 has no native FP8/MXFP4 support and
-# cannot use them, so stubbing is safe: we only raise if something calls them.
+# There are two distinct ways this breaks, and this shim handles both:
+#
+#   a) aiter is installed but the layout differs. Released aiter builds place
+#      those kernels directly under aiter/ops/triton/ with no gemm/fused
+#      subpackage, so the import raises ModuleNotFoundError.
+#
+#   b) aiter is not installed at all -- which is this image's situation, since
+#      aiter is a CDNA project we deliberately do not build. sglang treats
+#      "running on HIP" as "aiter is present", so `import aiter` itself is the
+#      failure:
+#          quark/schemes/quark_w4a4_mxfp4.py:86
+#              ModuleNotFoundError: No module named 'aiter'
+#      SGLANG_USE_AITER=0 does not help: these imports are at module scope and
+#      run before any flag is consulted.
+#
+# Case (b) is not a fixed list of modules -- the sglang tree has 8 top-level
+# and 122 conditional aiter imports, and the set moves with every upstream
+# bump. Patching them one at a time does not converge, so we fabricate the
+# whole `aiter` namespace lazily instead: any `aiter.*` module imports, any
+# attribute resolves, and only *calling* one raises.
+#
+# These are MXFP4/FP8 kernels for CDNA. RDNA3 has no native FP8/MXFP4 support
+# and cannot use them, so a placeholder that raises on call is exactly right:
+# nothing on a working RDNA3 path ever reaches one.
 # ---------------------------------------------------------------------------
 _AITER_STUB_MODULES = (
     "aiter.ops.triton.gemm",
@@ -39,12 +61,97 @@ _AITER_STUB_MODULES = (
     "aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat",
 )
 
+_AITER_ABSENT_MSG = (
+    "aiter is a CDNA-only (gfx942) kernel library and is not installed in this "
+    "RDNA3 image; {0} is a placeholder that exists only so `import sglang` "
+    "succeeds. Reaching it means a CDNA-only code path was taken on gfx110x -- "
+    "serve BF16/FP16 weights instead of MXFP4/FP8 quantized ones."
+)
+
+
+class _AiterPlaceholder(types.ModuleType):
+    """A module whose every attribute is a function that refuses to run."""
+
+    def __getattr__(self, name: str) -> Any:
+        # Dunders must still fail normally: the import machinery, inspect,
+        # and pickle all probe for them and expect AttributeError.
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+
+        def _unavailable(*_args: Any, **_kwargs: Any):
+            raise RuntimeError(_AITER_ABSENT_MSG.format(f"{self.__name__}.{name}"))
+
+        _unavailable.__name__ = name
+        _unavailable.__qualname__ = f"{self.__name__}.{name}"
+        _unavailable._rdna3_placeholder = True  # type: ignore[attr-defined]
+        return _unavailable
+
+
+class _AiterPlaceholderFinder(MetaPathFinder, Loader):
+    """Fabricates `aiter` and every submodule under it, on demand."""
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "aiter" or fullname.startswith("aiter."):
+            return ModuleSpec(fullname, self, is_package=True)
+        return None
+
+    def create_module(self, spec):
+        module = _AiterPlaceholder(spec.name)
+        module.__path__ = []  # a package, so submodules resolve through us too
+        module._rdna3_placeholder = True
+        return module
+
+    def exec_module(self, module):
+        pass  # nothing to execute; attributes are synthesized on access
+
+
+def _disarm_aiter_presence_probes() -> str:
+    """Stop libraries that detect aiter *by importing it* from taking the bait.
+
+    Fabricating a module has a cost: code that asks "is aiter here?" by trying
+    to import it now gets yes. sglang itself is safe -- it gates every *use* of
+    aiter on the SGLANG_USE_AITER env var (off by default), and only its
+    module-scope imports were unconditional. apex is not so careful.
+    apex/transformer/functional/fused_rope.py does:
+
+        if IS_ROCM_PYTORCH and USE_ROCM_AITER_ROPE_BACKEND:
+            try:
+                import aiter
+                AITER_ROPE_BACKEND = True
+
+    With a placeholder in place that switches RoPE onto a kernel that does not
+    exist, and the failure lands in the middle of a forward pass instead of at
+    import -- strictly worse than the crash we set out to fix. apex documents
+    an off switch; use it, unless the operator has expressed a preference.
+
+    This has to run before apex is imported. The .pth bootstrap guarantees
+    that: it fires on the first ``sglang*`` import, and apex only ever gets
+    pulled in from inside sglang.
+    """
+    import os
+
+    if "USE_ROCM_AITER_ROPE_BACKEND" in os.environ:
+        return ""  # operator set it explicitly; not ours to override
+    os.environ["USE_ROCM_AITER_ROPE_BACKEND"] = "0"
+    if "apex.transformer.functional.fused_rope" in sys.modules:
+        return "; WARNING: apex was already imported, its RoPE backend may be aiter"
+    return "; apex RoPE pinned to its native kernel"
+
+
+def _install_aiter_placeholder() -> str:
+    if any(isinstance(f, _AiterPlaceholderFinder) for f in sys.meta_path):
+        return "already applied (aiter placeholder installed)"
+    note = _disarm_aiter_presence_probes()
+    # Ahead of the real finders, so nothing can half-import a partial aiter.
+    sys.meta_path.insert(0, _AiterPlaceholderFinder())
+    return f"applied (aiter absent; whole-package placeholder installed{note})"
+
 
 def _stub_aiter_gemm_submodules() -> str:
     try:
         import aiter  # noqa: F401
     except Exception:
-        return "skipped (aiter not installed)"
+        return _install_aiter_placeholder()
 
     try:
         import aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat  # noqa: F401
@@ -498,22 +605,54 @@ def _patch_ptx_primitives() -> str:
     return f"applied ({len(applied)} primitives)"
 
 
+#: ``(name, function, deferrable)``.
+#:
+#: *deferrable* marks a shim whose target lives inside SGLang itself. Those
+#: cannot run on the first pass -- the bootstrap fires mid-``import sglang``,
+#: so the submodule they patch is not importable yet -- and a "skipped" from
+#: one of them means "ask again later", not "not applicable". They are the
+#: shims :mod:`~sglang_radeon_rdna3._bootstrap` retries.
+#:
+#: ``fused_add_rms_norm_arity`` is deliberately not deferrable: it patches
+#: vLLM, so "skipped (vllm not installed)" is a final answer.
 _SHIMS = (
-    ("aiter_gemm_stubs", _stub_aiter_gemm_submodules),
-    ("fused_add_rms_norm_arity", _patch_fused_add_rms_norm),
-    ("nested_weight_detection", _patch_nested_weight_detection),
-    ("h3_denoise_platform_gate", _patch_h3_denoise_platform_gate),
-    ("decline_cuda_only_jit_kernels", _decline_cuda_only_jit_kernels),
-    ("ptx_primitives", _patch_ptx_primitives),
+    ("aiter_gemm_stubs", _stub_aiter_gemm_submodules, False),
+    ("fused_add_rms_norm_arity", _patch_fused_add_rms_norm, False),
+    ("nested_weight_detection", _patch_nested_weight_detection, True),
+    ("h3_denoise_platform_gate", _patch_h3_denoise_platform_gate, True),
+    ("decline_cuda_only_jit_kernels", _decline_cuda_only_jit_kernels, True),
+    ("ptx_primitives", _patch_ptx_primitives, True),
 )
+
+#: Statuses that mean "this shim is finished, do not run it again".
+_SETTLED = ("applied", "already applied")
+
+
+def deferred_shims() -> list[str]:
+    """Shims still waiting for the module they patch to become importable."""
+    return [name for name, status in STATUS.items() if status.startswith("deferred")]
 
 
 def apply_all() -> dict[str, str]:
-    """Apply every compatibility shim. Safe to call more than once."""
-    for name, fn in _SHIMS:
+    """Apply every compatibility shim. Safe to call more than once.
+
+    Shims that have already applied are not re-run -- some of them walk whole
+    package trees, and the bootstrap may call this repeatedly while deferred
+    shims wait for their targets.
+    """
+    for name, fn, deferrable in _SHIMS:
+        if STATUS.get(name, "").startswith(_SETTLED):
+            continue
         try:
-            STATUS[name] = fn()
+            status = fn()
         except Exception as exc:  # never block startup on a shim
             STATUS[name] = f"FAILED: {exc}"
             logger.warning("RDNA3 compat shim %r failed: %s", name, exc)
+            continue
+        if deferrable and status.startswith("skipped"):
+            # Not "not applicable" -- "not importable yet". Saying "skipped"
+            # here is what let a shim silently never apply while doctor,
+            # which runs after everything is imported, showed it as fine.
+            status = "deferred" + status[len("skipped"):]
+        STATUS[name] = status
     return STATUS

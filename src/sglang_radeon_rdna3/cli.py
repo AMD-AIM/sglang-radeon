@@ -119,6 +119,37 @@ def _check_sglang_import() -> tuple[str, str]:
     return _OK, f"sglang from {os.path.dirname(path)}"
 
 
+def _check_serve_imports() -> tuple[str, str]:
+    """Walk the import chain `sglang serve` walks. Nothing else can.
+
+    The Dockerfile smoke test stops at `import sglang.multimodal_gen`, and it
+    has to: everything past that point reaches for a GPU while merely being
+    imported (kernels/ops/quantization/fp8_kernel.py calls
+    torch.cuda.get_device_properties(0) at module scope), so a GPU-less builder
+    cannot go further no matter how healthy the image is. That leaves the serve
+    path -- the one users actually run -- unverified until runtime.
+
+    It has already cost us once: an image shipped green with
+    `ModuleNotFoundError: No module named 'aiter'` on exactly this chain. Here
+    there is a real GPU, so there is no reason to stop.
+    """
+    try:
+        import sglang.srt.layers.quantization  # noqa: F401
+    except Exception as exc:
+        return _BAD, (
+            f"the quantization import chain is broken ({type(exc).__name__}: "
+            f"{exc})\n"
+            "        every model module imports it, so serving cannot start."
+        )
+    try:
+        import sglang.cli.serve  # noqa: F401
+    except Exception as exc:
+        return _BAD, (
+            f"cannot import the serve entrypoint ({type(exc).__name__}: {exc})"
+        )
+    return _OK, "serve import chain complete (quantization + cli.serve)"
+
+
 def _check_platform() -> tuple[str, str]:
     try:
         from sglang.srt.utils.common import is_cuda, is_hip
@@ -127,6 +158,42 @@ def _check_platform() -> tuple[str, str]:
     if is_hip() and not is_cuda():
         return _OK, "sglang detects ROCm/HIP"
     return _BAD, f"unexpected platform: is_hip={is_hip()} is_cuda={is_cuda()}"
+
+
+def _check_diffusion_platform() -> tuple[str, str]:
+    """SGLang-Diffusion keeps its own platform detection, and it can be wrong.
+
+    It does not ask torch. It probes for GPUs through amdsmi
+    (platforms/__init__.py::rocm_platform_plugin) and falls back to
+    CpuPlatform when that import fails -- which it does silently, because the
+    probe is wrapped in `except Exception: logger.debug(...)`.
+
+    The result is a diffusion runtime that believes it is on a CPU while
+    sitting on a working GPU. It does not crash. It reports host RAM as
+    available memory, and MiniMax-H3's denoise loop refuses to start because
+    its platform gate wants CUDA or MPS. Nothing else in this report would
+    catch it: torch, sgl_kernel and the LLM stack are all perfectly happy.
+    """
+    try:
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+    except Exception as exc:
+        return _WARN, f"diffusion platform unavailable ({type(exc).__name__}: {exc})"
+
+    name = type(current_platform).__name__
+    if current_platform.is_hip():
+        return _OK, f"diffusion platform is {name}"
+    try:
+        import amdsmi  # noqa: F401
+    except Exception:
+        return _BAD, (
+            f"diffusion resolved to {name}, not ROCm -- amdsmi is not "
+            "installed, so its GPU probe found nothing.\n"
+            "        pip install --no-deps /opt/rocm/share/amd_smi"
+        )
+    return _BAD, (
+        f"diffusion resolved to {name}, not ROCm, despite amdsmi being "
+        "installed -- its GPU probe found no devices."
+    )
 
 
 def _check_attention_backends() -> tuple[str, str]:
@@ -169,13 +236,16 @@ def cmd_doctor(_args) -> int:
               f"{g.total_memory_gib} GiB, {g.compute_units} CUs{note}")
 
     print()
-    for status, msg in (
+    results = (
         _check_sglang_import(),
         _check_sgl_kernel(),
         _check_platform(),
+        _check_serve_imports(),
+        _check_diffusion_platform(),
         _check_attention_backends(),
         _check_models(),
-    ):
+    )
+    for status, msg in results:
         print(f"  [{status}] {msg}")
 
     print("\n  compat shims:")
@@ -190,6 +260,17 @@ def cmd_doctor(_args) -> int:
             else f"--{k.replace('_', '-')} {v}"
             for k, v in rec.items()
         ))
+
+    # Exit non-zero when something is actually broken. This is the image's
+    # CMD, so the exit code is what an orchestrator sees: a doctor that always
+    # reports success is not a doctor, and a container that starts cleanly on a
+    # broken image is how a defect reaches production.
+    broken = [msg for status, msg in results if status == _BAD]
+    if not gpus:
+        broken.append("no GPU visible to torch")
+    if broken:
+        print(f"\n  {len(broken)} problem(s) found -- see [{_BAD}] above.")
+        return 1
     return 0
 
 
