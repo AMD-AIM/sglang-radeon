@@ -724,6 +724,154 @@ def _patch_ptx_primitives() -> str:
     return f"applied ({len(applied)} primitives)"
 
 
+# ---------------------------------------------------------------------------
+# Shim 7 -- a varlen attention primitive, so VDN-H3 has one at all.
+#
+# VDN-H3 (OpenVDN/MiniMax-H3) hard-requires the HYBRID_WINDOW_ATTN_H3 backend
+# and raises ValueError for any other. That backend rides varlen
+# FlashAttention, and on RDNA3 there is no varlen kernel of any kind:
+#
+#   * `flash_attn_varlen_func` dispatches on `ver` (default 3) to
+#     FlashAttention-3, which is Hopper-only;
+#   * the `flash_attn` package in the ROCm image is an empty namespace
+#     package -- `flash_attn.__file__` is None, and importing
+#     `flash_attn_varlen_func` from it raises ImportError.
+#
+# Everything funnels through that one symbol, including the dense fallback
+# (`FlashAttentionImpl.forward_varlen`) and the two custom ops wrapping it, so
+# one replacement covers the whole surface. See varlen_attention.py for what
+# it does and -- more importantly -- what it refuses to approximate.
+#
+# This is the shim most likely to be *wrong* rather than merely absent, so it
+# rebinds by identity against the original function and reports a count.
+# ---------------------------------------------------------------------------
+_VARLEN_HOME = "sglang.kernels.ops.attention.flash_attention"
+
+
+def _install_varlen_attention() -> str:
+    try:
+        from sglang.srt.utils.common import is_hip
+    except Exception:
+        return "skipped (sglang not available)"
+    if not is_hip():
+        return "not needed (not a HIP platform)"
+
+    import importlib
+
+    try:
+        home = importlib.import_module(_VARLEN_HOME)
+    except Exception as exc:
+        return f"skipped (cannot import {_VARLEN_HOME}: {exc})"
+
+    original = getattr(home, "flash_attn_varlen_func", None)
+    if original is not None and getattr(original, "_rdna3_wrapped", False):
+        return "already applied"
+
+    from .varlen_attention import flash_attn_varlen_func as replacement
+
+    replacement._rdna3_wrapped = True  # type: ignore[attr-defined]
+
+    setattr(home, "flash_attn_varlen_func", replacement)
+    rebound = 1
+
+    # Callers do `from ... import flash_attn_varlen_func` at module scope, so
+    # copies already exist. Match on *identity* against the function we just
+    # displaced: a module that merely defines something by the same name is
+    # not our copy, and overwriting it would be a silent corruption of
+    # unrelated code. Same rule as the PTX shim above.
+    if original is not None:
+        for module in list(sys.modules.values()):
+            if module is None or module is home:
+                continue
+            namespace = getattr(module, "__dict__", None)
+            if not isinstance(namespace, dict):
+                continue
+            if namespace.get("flash_attn_varlen_func") is original:
+                setattr(module, "flash_attn_varlen_func", replacement)
+                rebound += 1
+
+    return f"applied ({rebound} bindings)"
+
+
+# ---------------------------------------------------------------------------
+# Shim 8 -- let the ROCm platform resolve HYBRID_WINDOW_ATTN_H3.
+#
+# `RocmPlatform.get_attn_backend_cls_str` is an if/elif chain over the backend
+# enum with no arm for HYBRID_WINDOW_ATTN_H3 -- the backend is only wired up in
+# platforms/cuda.py, behind a resolver keyed on SM capability. So even with a
+# working varlen primitive (shim 7) the backend cannot be *selected* on ROCm,
+# and VDN-H3 fails at the ValueError in minimax_h3_vdn_attention.py rather
+# than anywhere that mentions platforms.
+#
+# The backend class itself is device-agnostic Python: it plans row gathers and
+# makes dense varlen calls. Nothing in it is CUDA-specific once the primitive
+# underneath exists, which is exactly what shim 7 provides.
+#
+# Order matters: this shim is useless without shim 7, and would turn a clean
+# "backend unavailable" into an ImportError deep in the denoise loop. It
+# therefore refuses to apply unless the varlen shim has settled.
+# ---------------------------------------------------------------------------
+_HYBRID_BACKEND_CLS = (
+    "sglang.multimodal_gen.runtime.layers.attention.backends"
+    ".hybrid_window_attn_h3.HybridWindowAttentionH3Backend"
+)
+
+
+def _enable_hybrid_window_h3_on_rocm() -> str:
+    try:
+        from sglang.srt.utils.common import is_hip
+    except Exception:
+        return "skipped (sglang not available)"
+    if not is_hip():
+        return "not needed (not a HIP platform)"
+
+    varlen = STATUS.get("varlen_attention", "")
+    if not varlen.startswith(_SETTLED):
+        # Two different situations, and the wording decides whether the
+        # bootstrap tries again -- it retires the import watcher once no shim
+        # reports "deferred".
+        if varlen.startswith("deferred"):
+            # Within one pass `varlen_attention` runs first (see _SHIMS), so
+            # this only means SGLang is not importable yet. Its own "deferred"
+            # keeps the watcher alive; we ride along and settle next pass.
+            return f"deferred (waiting for varlen_attention: {varlen})"
+        # Failed, or declared not-applicable. Enabling the backend now would
+        # trade a clean "backend unavailable" for an ImportError deep in the
+        # denoise loop, minutes into a run.
+        return f"declined (varlen_attention is {varlen!r})"
+
+    try:
+        from sglang.multimodal_gen.runtime.platforms.rocm import RocmPlatform
+        from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+    except Exception as exc:
+        return f"skipped (ROCm platform not importable: {exc})"
+
+    real = RocmPlatform.__dict__.get("get_attn_backend_cls_str")
+    if real is None:
+        return "FAILED: RocmPlatform has no get_attn_backend_cls_str"
+    inner = getattr(real, "__func__", real)
+    if getattr(inner, "_rdna3_wrapped", False):
+        return "already applied"
+
+    target = AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
+
+    def get_attn_backend_cls_str(cls, selected_backend, head_size, dtype):
+        if selected_backend is target:
+            logger.info("Using HybridWindowAttentionH3 backend on RDNA3 "
+                        "(varlen served by SDPA).")
+            return _HYBRID_BACKEND_CLS
+        return inner(cls, selected_backend, head_size, dtype)
+
+    get_attn_backend_cls_str._rdna3_wrapped = True  # type: ignore[attr-defined]
+    get_attn_backend_cls_str._rdna3_real = inner  # type: ignore[attr-defined]
+    try:
+        RocmPlatform.get_attn_backend_cls_str = classmethod(
+            get_attn_backend_cls_str)
+    except Exception as exc:
+        return f"FAILED: {exc}"
+    return "applied"
+
+
 #: ``(name, function, deferrable)``.
 #:
 #: *deferrable* marks a shim whose target lives inside SGLang itself. Those
@@ -743,6 +891,10 @@ _SHIMS = (
     ("custom_all_reduce", _decline_custom_all_reduce, True),
     ("decline_cuda_only_jit_kernels", _decline_cuda_only_jit_kernels, True),
     ("ptx_primitives", _patch_ptx_primitives, True),
+    # Order is load-bearing: the platform shim declines unless the varlen
+    # primitive is already in place. See shim 8.
+    ("varlen_attention", _install_varlen_attention, True),
+    ("hybrid_window_h3_on_rocm", _enable_hybrid_window_h3_on_rocm, True),
 )
 
 #: Statuses that mean "this shim is finished, do not run it again".
