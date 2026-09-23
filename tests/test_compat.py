@@ -328,3 +328,53 @@ def test_lora_quant_method_shim_defers_when_sglang_is_absent(monkeypatch):
     # Deferrable, so apply_all turns that "skipped" into a retry rather than
     # recording it as a permanent pass.
     assert dict((n, d) for n, _, d in compat._SHIMS)["lora_quant_method"] is True
+
+
+def _fake_group_coordinator(monkeypatch):
+    class GroupCoordinator:
+        unique_name = "tp:0"
+
+        def _init_srt_custom_allreduce(self):
+            raise RuntimeError("aiter is a CDNA-only (gfx942) kernel library")
+
+    name = "sglang.multimodal_gen.runtime.distributed.group_coordinator"
+    mod = types.ModuleType(name)
+    mod.GroupCoordinator = GroupCoordinator
+    parts = name.split(".")
+    for i in range(1, len(parts)):
+        parent = ".".join(parts[:i])
+        monkeypatch.setitem(sys.modules, parent, types.ModuleType(parent))
+    monkeypatch.setitem(sys.modules, name, mod)
+    return GroupCoordinator
+
+
+def test_custom_all_reduce_is_declined_on_rdna3(monkeypatch):
+    coordinator = _fake_group_coordinator(monkeypatch)
+    from sglang_radeon_rdna3 import hardware
+
+    monkeypatch.setattr(
+        hardware,
+        "detect_gpus",
+        lambda: [hardware.GpuInfo(0, "gfx1100", "W7900D", 48.0, 48)],
+    )
+
+    assert compat._decline_custom_all_reduce() == "applied"
+
+    # The point of the shim: leave srt_custom_allreduce as None so that
+    # GroupCoordinator.all_reduce falls through to torch.distributed.
+    inst = coordinator()
+    inst._init_srt_custom_allreduce()
+    assert inst.srt_custom_allreduce is None
+    assert compat._decline_custom_all_reduce() == "already applied"
+
+
+def test_custom_all_reduce_is_left_alone_on_cdna(monkeypatch):
+    _fake_group_coordinator(monkeypatch)
+    from sglang_radeon_rdna3 import hardware
+
+    monkeypatch.setattr(
+        hardware,
+        "detect_gpus",
+        lambda: [hardware.GpuInfo(0, "gfx942", "MI300X", 192.0, 304)],
+    )
+    assert compat._decline_custom_all_reduce().startswith("not needed")

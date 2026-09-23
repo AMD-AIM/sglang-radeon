@@ -159,6 +159,14 @@ attribute 'quant_method'` — while the server still logs "fired up and ready to
 roll", because the synthetic warmup swallows the exception. We add the missing
 delegation. (Also not RDNA3-specific.)
 
+**Tensor parallelism dies during distributed init.** `parallel_state` turns on
+SGLang's custom all-reduce for every TP group, with no flag to turn it off. On
+HIP that class comes from aiter, which is CDNA-only, so `--tp-size > 1` kills
+every rank before a model loads. Installing aiter would be worse than useless:
+custom all-reduce reads peer buffers over IPC, and on gfx1100 a peer's write
+does not invalidate our L2 — it would reduce stale values, quietly. We decline
+it and let RCCL do the reduction, which is what this card should use anyway.
+
 ## Why a `.pth` file and not only the plugin entry point
 
 SGLang has an entry-point plugin system, and this package registers with it.

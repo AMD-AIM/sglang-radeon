@@ -346,6 +346,71 @@ def _patch_lora_quant_method_delegation() -> str:
     return "applied"
 
 
+def _decline_custom_all_reduce() -> str:
+    """Take tensor parallelism off the IPC all-reduce and back onto RCCL.
+
+    ``parallel_state`` hard-wires ``use_srt_custom_allreduce=True`` for every
+    tensor-parallel group -- there is no server_args flag and no env var. On
+    HIP, the class it reaches for lives in aiter, which is CDNA-only and is not
+    in this image, so every rank dies during distributed init::
+
+        RuntimeError: aiter is a CDNA-only (gfx942) kernel library ...
+        aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce
+
+    and the launcher reports "Rank 0 scheduler is dead". Any ``--tp-size > 1``
+    run on RDNA3 stops there.
+
+    Installing aiter would not fix it, it would make it worse. Custom
+    all-reduce works by mapping each peer's buffer over IPC and reading their
+    writes directly. On gfx1100 a peer's write does not invalidate our L2, and
+    no shader instruction flushes it -- only the first dispatch after a host
+    sync sees fresh data. A peer-write-based reduction on this architecture is
+    not slow, it is wrong: it would silently reduce stale values. RCCL goes
+    through paths that do not have that hazard.
+
+    So declining is the correct answer for this card, not a workaround.
+    ``GroupCoordinator.all_reduce`` already treats ``srt_custom_allreduce is
+    None`` as "use torch.distributed", and ``graph_capture`` already swaps in a
+    ``nullcontext``, so leaving it None needs no other change.
+
+    Scoped to gfx11xx. If someone runs this package on CDNA with real aiter,
+    custom all-reduce stays enabled and the fast path is untouched.
+    """
+    try:
+        from sglang.multimodal_gen.runtime.distributed import group_coordinator
+    except Exception:
+        return "skipped (sglang-diffusion distributed layer not available)"
+
+    coordinator = getattr(group_coordinator, "GroupCoordinator", None)
+    if coordinator is None:
+        return "skipped (GroupCoordinator not found)"
+    if getattr(coordinator, "_rdna3_declines_custom_ar", False):
+        return "already applied"
+
+    from .hardware import detect_gpus
+
+    # An empty list means torch sees no GPU at all -- patch anyway. It costs
+    # nothing (a process with no GPU never builds a TP group) and it keeps the
+    # shim from silently standing down in a rank whose devices are not visible
+    # yet. Only a machine that demonstrably has non-RDNA3 GPUs keeps the fast
+    # path.
+    gpus = detect_gpus()
+    if gpus and not any(g.is_rdna3 for g in gpus):
+        return "not needed (no RDNA3 GPU visible)"
+
+    def _init_srt_custom_allreduce(self) -> None:
+        logger.info(
+            "RDNA3: declining custom all-reduce for group %r; falling back to "
+            "RCCL (peer writes are not L2-coherent on gfx11xx)",
+            getattr(self, "unique_name", "?"),
+        )
+        self.srt_custom_allreduce = None
+
+    coordinator._init_srt_custom_allreduce = _init_srt_custom_allreduce
+    coordinator._rdna3_declines_custom_ar = True
+    return "applied"
+
+
 def _patch_h3_denoise_platform_gate() -> str:
     try:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages import (  # noqa: E501
@@ -675,6 +740,7 @@ _SHIMS = (
     ("nested_weight_detection", _patch_nested_weight_detection, True),
     ("h3_denoise_platform_gate", _patch_h3_denoise_platform_gate, True),
     ("lora_quant_method", _patch_lora_quant_method_delegation, True),
+    ("custom_all_reduce", _decline_custom_all_reduce, True),
     ("decline_cuda_only_jit_kernels", _decline_cuda_only_jit_kernels, True),
     ("ptx_primitives", _patch_ptx_primitives, True),
 )
