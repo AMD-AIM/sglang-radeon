@@ -292,6 +292,60 @@ def _patch_nested_weight_detection() -> str:
 # That is narrow enough to be safe here: is_cuda_alike() already treats ROCm
 # as CUDA-like elsewhere in the same codebase.
 # ---------------------------------------------------------------------------
+def _patch_lora_quant_method_delegation() -> str:
+    """Give the LoRA linear wrapper the ``quant_method`` it forgot to forward.
+
+    ``BaseLayerWithLoRA`` wraps a linear layer and re-exposes the attributes
+    callers expect: ``weight`` and ``bias`` are both properties delegating to
+    ``self.base_layer``. ``quant_method`` was left out. The class's own
+    ``can_merge_base_weight`` reaches through to ``self.base_layer.quant_method``
+    explicitly, so the attribute is there -- only the delegation is missing.
+
+    The gap is invisible until something asks a *wrapped* layer about its
+    quantization. The MiniMax-H3 DiT does, once per MLP per block::
+
+        if _accepts_mxfp8_input(self.fc2) and can_use_silu_mul_mxfp8(hidden):
+
+    and ``_accepts_mxfp8_input`` reads ``linear.quant_method`` with no default,
+    so ``nn.Module.__getattr__`` raises. Serving H3 with ``--lora-path`` then
+    fails on every single request::
+
+        'RowParallelLinearWithLoRA' object has no attribute 'quant_method'
+
+    The server comes up anyway: the synthetic warmup swallows the exception,
+    logs "Synthetic server warmup failed; continuing startup", and announces
+    "The server is fired up and ready to roll!". /health returns 200 on a
+    server that cannot generate anything -- the same shape of lie the rest of
+    this module exists to catch.
+
+    This is not RDNA3-specific; it breaks identically on CDNA, so the real fix
+    belongs upstream. It lives here because it sits squarely in the path of
+    running H3 with the Turbo LoRA, which is what this package is for.
+    Delegating (rather than returning None) keeps the predicate honest: where
+    MXFP8 really is available, the answer stays the base layer's real answer.
+    """
+    try:
+        from sglang.multimodal_gen.runtime.layers.lora.linear import (
+            BaseLayerWithLoRA,
+        )
+    except Exception:
+        return "skipped (sglang-diffusion LoRA layers not available)"
+
+    # Order matters: our own property also lands in vars(), so ask about the
+    # marker first or a second pass would report "not needed".
+    if getattr(BaseLayerWithLoRA, "_rdna3_quant_method_patched", False):
+        return "already applied"
+    if "quant_method" in vars(BaseLayerWithLoRA):
+        return "not needed (upstream delegates quant_method)"
+
+    def quant_method(self):
+        return getattr(self.base_layer, "quant_method", None)
+
+    BaseLayerWithLoRA.quant_method = property(quant_method)
+    BaseLayerWithLoRA._rdna3_quant_method_patched = True
+    return "applied"
+
+
 def _patch_h3_denoise_platform_gate() -> str:
     try:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages import (  # noqa: E501
@@ -620,6 +674,7 @@ _SHIMS = (
     ("fused_add_rms_norm_arity", _patch_fused_add_rms_norm, False),
     ("nested_weight_detection", _patch_nested_weight_detection, True),
     ("h3_denoise_platform_gate", _patch_h3_denoise_platform_gate, True),
+    ("lora_quant_method", _patch_lora_quant_method_delegation, True),
     ("decline_cuda_only_jit_kernels", _decline_cuda_only_jit_kernels, True),
     ("ptx_primitives", _patch_ptx_primitives, True),
 )

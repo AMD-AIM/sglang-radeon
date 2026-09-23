@@ -241,3 +241,90 @@ def test_apply_all_does_not_rerun_applied_shims(monkeypatch):
     compat.apply_all()
     assert len(calls) == 1
     assert compat.deferred_shims() == []
+
+
+def _fake_lora_module(monkeypatch):
+    """Stand in for sglang's LoRA linear module, shaped like the real one.
+
+    The real ``BaseLayerWithLoRA`` delegates ``weight`` and ``bias`` to the
+    wrapped layer and stops there; ``quant_method`` is reachable only as
+    ``self.base_layer.quant_method``. Plain classes raise AttributeError for a
+    missing attribute exactly like ``nn.Module.__getattr__`` does, so no torch
+    is needed to reproduce the failure.
+    """
+
+    class BaseLayerWithLoRA:
+        def __init__(self, base_layer):
+            self.base_layer = base_layer
+
+        @property
+        def weight(self):
+            return self.base_layer.weight
+
+    class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
+        pass
+
+    mod = types.ModuleType("sglang.multimodal_gen.runtime.layers.lora.linear")
+    mod.BaseLayerWithLoRA = BaseLayerWithLoRA
+    mod.RowParallelLinearWithLoRA = RowParallelLinearWithLoRA
+
+    pkg = "sglang.multimodal_gen.runtime.layers.lora.linear"
+    parts = pkg.split(".")
+    for i in range(1, len(parts)):
+        name = ".".join(parts[:i])
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, pkg, mod)
+    return mod
+
+
+def test_lora_wrapper_gets_quant_method_from_its_base_layer(monkeypatch):
+    mod = _fake_lora_module(monkeypatch)
+
+    class Base:
+        weight = "w"
+        quant_method = "the real quant method"
+
+    layer = mod.RowParallelLinearWithLoRA(Base())
+
+    # This is the bug: H3's _accepts_mxfp8_input reads it with no default.
+    with pytest.raises(AttributeError, match="quant_method"):
+        layer.quant_method
+
+    assert compat._patch_lora_quant_method_delegation() == "applied"
+
+    # Delegated, not stubbed -- on hardware that does have MXFP8 the predicate
+    # must still get the base layer's real answer.
+    assert layer.quant_method == "the real quant method"
+    assert compat._patch_lora_quant_method_delegation() == "already applied"
+
+
+def test_lora_quant_method_is_none_when_the_base_layer_has_none(monkeypatch):
+    mod = _fake_lora_module(monkeypatch)
+
+    class Base:
+        weight = "w"
+
+    layer = mod.BaseLayerWithLoRA(Base())
+    assert compat._patch_lora_quant_method_delegation() == "applied"
+    # _accepts_mxfp8_input short-circuits on None; it must not raise.
+    assert layer.quant_method is None
+
+
+def test_lora_quant_method_shim_stands_down_once_upstream_fixes_it(monkeypatch):
+    mod = _fake_lora_module(monkeypatch)
+    mod.BaseLayerWithLoRA.quant_method = property(
+        lambda self: self.base_layer.quant_method
+    )
+    assert compat._patch_lora_quant_method_delegation().startswith("not needed")
+
+
+def test_lora_quant_method_shim_defers_when_sglang_is_absent(monkeypatch):
+    for name in list(sys.modules):
+        if name == "sglang" or name.startswith("sglang."):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.setattr(sys, "path", [])
+    status = compat._patch_lora_quant_method_delegation()
+    assert status.startswith("skipped")
+    # Deferrable, so apply_all turns that "skipped" into a retry rather than
+    # recording it as a permanent pass.
+    assert dict((n, d) for n, _, d in compat._SHIMS)["lora_quant_method"] is True

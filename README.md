@@ -150,6 +150,15 @@ Any Gemma-style RMSNorm model — Qwen3.8-27B included — dies on its first
 token. We wrap the kernel so both call shapes work. (This one is not
 RDNA3-specific; it just happens to block us too.)
 
+**A LoRA-wrapped layer cannot say how it is quantized.** `BaseLayerWithLoRA`
+delegates `weight` and `bias` to the layer it wraps but not `quant_method`,
+and MiniMax-H3's DiT reads `linear.quant_method` once per MLP per block to
+decide whether to take its MXFP8 path. Serving H3 with `--lora-path` therefore
+fails on every request with `'RowParallelLinearWithLoRA' object has no
+attribute 'quant_method'` — while the server still logs "fired up and ready to
+roll", because the synthetic warmup swallows the exception. We add the missing
+delegation. (Also not RDNA3-specific.)
+
 ## Why a `.pth` file and not only the plugin entry point
 
 SGLang has an entry-point plugin system, and this package registers with it.
