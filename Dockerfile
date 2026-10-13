@@ -23,9 +23,8 @@ FROM ${ROCM_PYTORCH_IMAGE}
 RUN python3 -c "import torch, sys; sys.exit(0 if torch.version.hip else \
       'base image has a CUDA PyTorch (%s); use a ROCm one' % torch.__version__)"
 
-# SGLANG_REF must be a *branch* name -- the tarball below is fetched from
-# refs/heads. Upstream publishes release branches alongside tags, so
-# "v0.5.19" works as-is.
+# SGLANG_REF is a branch name or a full commit sha; codeload resolves either.
+# Upstream publishes release branches alongside tags, so "v0.5.19" works as-is.
 #
 # The two refs are not interchangeable, and neither is strictly better:
 #
@@ -48,6 +47,7 @@ ARG AMDGPU_TARGETS=gfx1100
 LABEL org.opencontainers.image.source="https://github.com/AMD-AIM/sglang-radeon"
 LABEL org.opencontainers.image.description="SGLang for AMD Radeon RDNA3 (gfx110x)"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL io.github.amd-aim.sglang-ref="${SGLANG_REF}"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTORCH_ALLOC_CONF=expandable_segments:True \
@@ -64,7 +64,7 @@ RUN apt-get update -qq \
 # tarball it is -- same content as a clone, without ~500 MB of history.
 RUN mkdir -p ${SGLANG_SRC} \
  && curl -fsSL --retry 3 \
-      "https://codeload.github.com/sgl-project/sglang/tar.gz/refs/heads/${SGLANG_REF}" \
+      "https://codeload.github.com/sgl-project/sglang/tar.gz/${SGLANG_REF}" \
     | tar xz -C ${SGLANG_SRC} --strip-components=1
 
 COPY . /opt/sglang-radeon
