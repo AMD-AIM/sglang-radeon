@@ -58,6 +58,10 @@ EXCLUDE = {
     "cuda-pathfinder",
     # CUDA-only wheel that shadows the locally built gfx1100 kernel
     "sglang-kernel",
+    # The PyPI wheel links libnvrtc. SGLang imports it from `sglang/__init__`
+    # and falls back to decord on ImportError, but a present-but-unloadable
+    # torchcodec raises OSError instead, so `import sglang` dies.
+    "torchcodec",
     # Provided by the ROCm install; never let pip re-resolve these
     "torch",
     "torchvision",
