@@ -8,6 +8,7 @@ corresponding shim becomes a no-op and can be deleted.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import sys
 import types
@@ -287,10 +288,11 @@ def _patch_nested_weight_detection() -> str:
 # "cuda:0" (HIP reuses the CUDA device namespace), so the loop itself has no
 # CUDA dependency; the allowlist simply predates ROCm support.
 #
-# Rather than patch the function we widen the predicate, by making
-# current_platform.is_cuda() report True on a HIP platform for the duration.
-# That is narrow enough to be safe here: is_cuda_alike() already treats ROCm
-# as CUDA-like elsewhere in the same codebase.
+# Rather than patch the function we widen the predicate, by giving that one
+# module a view of the platform whose is_cuda() reports True. The shared
+# current_platform object must stay untouched: diffusion CustomOp dispatch
+# asks it is_cuda() before is_hip(), so making it lie sends every fused layer
+# (Wan's norms, for one) to forward_cuda and its CUDA-only kernels.
 # ---------------------------------------------------------------------------
 def _patch_lora_quant_method_delegation() -> str:
     """Give the LoRA linear wrapper the ``quant_method`` it forgot to forward.
@@ -411,6 +413,23 @@ def _decline_custom_all_reduce() -> str:
     return "applied"
 
 
+class _CudaGatePlatform:
+    """A platform view whose ``is_cuda()`` is True; all else is the real one."""
+
+    _rdna3_wrapped = True
+
+    def __init__(self, real) -> None:
+        self._rdna3_real = real
+
+    def is_cuda(self) -> bool:
+        # HIP presents as CUDA to torch; the gate this satisfies only guards
+        # device-agnostic code.
+        return True
+
+    def __getattr__(self, name):
+        return getattr(self._rdna3_real, name)
+
+
 def _patch_h3_denoise_platform_gate() -> str:
     try:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages import (  # noqa: E501
@@ -422,24 +441,19 @@ def _patch_h3_denoise_platform_gate() -> str:
     platform = getattr(denoising, "current_platform", None)
     if platform is None:
         return "skipped (platform object not found)"
+    if getattr(platform, "_rdna3_wrapped", False):
+        return "already applied"
     if not getattr(platform, "is_hip", lambda: False)():
         return "not needed (not a HIP platform)"
-    if getattr(platform.is_cuda, "_rdna3_wrapped", False):
-        return "already applied"
-
-    real_is_cuda = platform.is_cuda
-
-    def is_cuda() -> bool:
-        # HIP presents as CUDA to torch; the gate this satisfies only guards
-        # device-agnostic code.
-        return True
-
-    is_cuda._rdna3_wrapped = True  # type: ignore[attr-defined]
-    is_cuda._rdna3_real = real_is_cuda  # type: ignore[attr-defined]
     try:
-        platform.is_cuda = is_cuda
-    except Exception as exc:
-        return f"FAILED: {exc}"
+        gate = inspect.getsource(denoising.MiniMaxH3DenoisingStage._run_full_loop)
+    except Exception:
+        gate = ""
+    if "is_hip()" in gate:
+        return "not needed (upstream gate accepts HIP)"
+
+    # Rebind the name in this module only; current_platform itself is shared.
+    denoising.current_platform = _CudaGatePlatform(platform)
     return "applied"
 
 

@@ -378,3 +378,63 @@ def test_custom_all_reduce_is_left_alone_on_cdna(monkeypatch):
         lambda: [hardware.GpuInfo(0, "gfx942", "MI300X", 192.0, 304)],
     )
     assert compat._decline_custom_all_reduce().startswith("not needed")
+
+
+class _HipPlatform:
+    def is_cuda(self):
+        return False
+
+    def is_hip(self):
+        return True
+
+
+class _OldGateStage:
+    def _run_full_loop(self, batch, server_args):
+        if not (current_platform.is_cuda() or current_platform.is_mps()):  # noqa: F821
+            raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA or MPS")
+
+
+class _NewGateStage:
+    def _run_full_loop(self, batch, server_args):
+        if not (current_platform.is_cuda() or current_platform.is_hip()):  # noqa: F821
+            raise RuntimeError("unsupported platform")
+
+
+def _fake_h3_denoising(monkeypatch, stage):
+    name = (
+        "sglang.multimodal_gen.runtime.pipelines_core.stages."
+        "model_specific_stages.minimax_h3.stages.denoising"
+    )
+    mod = types.ModuleType(name)
+    mod.current_platform = _HipPlatform()
+    mod.MiniMaxH3DenoisingStage = stage
+    parts = name.split(".")
+    for i in range(1, len(parts)):
+        parent = ".".join(parts[:i])
+        monkeypatch.setitem(sys.modules, parent, types.ModuleType(parent))
+    sys.modules[name.rsplit(".", 1)[0]].denoising = mod
+    monkeypatch.setitem(sys.modules, name, mod)
+    return mod
+
+
+def test_h3_gate_shim_leaves_the_shared_platform_alone(monkeypatch):
+    mod = _fake_h3_denoising(monkeypatch, _OldGateStage)
+    shared = mod.current_platform
+
+    assert compat._patch_h3_denoise_platform_gate() == "applied"
+
+    # The H3 module sees a CUDA-passing platform...
+    assert mod.current_platform.is_cuda() is True
+    assert mod.current_platform.is_hip() is True
+    # ...but the shared object does not change: CustomOp dispatch asks it
+    # is_cuda() first, and a True there sends Wan's fused norms to CuTe-DSL.
+    assert shared.is_cuda() is False
+    assert "is_cuda" not in vars(shared)
+    assert compat._patch_h3_denoise_platform_gate() == "already applied"
+
+
+def test_h3_gate_shim_stands_down_once_upstream_accepts_hip(monkeypatch):
+    mod = _fake_h3_denoising(monkeypatch, _NewGateStage)
+    shared = mod.current_platform
+    assert compat._patch_h3_denoise_platform_gate().startswith("not needed")
+    assert mod.current_platform is shared
